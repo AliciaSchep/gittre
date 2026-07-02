@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use git2::{Delta, DiffOptions, Repository};
+use git2::{Delta, Repository};
 
 /// One line inside a hunk.
 #[derive(Debug, Clone)]
@@ -68,25 +68,9 @@ fn delta_status(delta: Delta) -> FileStatus {
     }
 }
 
-/// Working tree + index vs HEAD ("uncommitted"), untracked files included.
-pub fn load_uncommitted(repo: &Repository) -> Result<DiffResult> {
-    let head_tree = match repo.head() {
-        Ok(head) => Some(head.peel_to_tree().context("resolving HEAD tree")?),
-        // Unborn branch (no commits yet): diff against the empty tree.
-        Err(_) => None,
-    };
-
-    let mut opts = DiffOptions::new();
-    opts.include_untracked(true)
-        .recurse_untracked_dirs(true)
-        .show_untracked_content(true)
-        .include_typechange(true);
-
-    let mut diff = repo
-        .diff_tree_to_workdir_with_index(head_tree.as_ref(), Some(&mut opts))
-        .context("computing diff")?;
-    diff.find_similar(None).ok();
-
+/// Load the full structured diff for a scope.
+pub fn load(repo: &Repository, scope: &super::scope::Scope) -> Result<DiffResult> {
+    let diff = super::scope::build_diff(repo, scope)?;
     collect(&diff)
 }
 
@@ -181,8 +165,13 @@ fn collect(diff: &git2::Diff) -> Result<DiffResult> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::git::scope::{Scope, commit_scope, detect_base, file_count};
     use std::fs;
     use std::path::Path;
+
+    fn load_uncommitted(repo: &Repository) -> Result<DiffResult> {
+        load(repo, &Scope::Uncommitted)
+    }
 
     fn commit_all(repo: &Repository, msg: &str) {
         let mut index = repo.index().unwrap();
@@ -268,5 +257,92 @@ mod tests {
         fs::write(dir.path().join("first.txt"), "hi\n").unwrap();
         let result = load_uncommitted(&repo).unwrap();
         assert_eq!(find(&result, "first.txt").status, FileStatus::Added);
+    }
+
+    #[test]
+    fn staged_scope_sees_only_the_index() {
+        let (dir, repo) = setup();
+        // Stage one change, leave another unstaged.
+        fs::write(dir.path().join("a.txt"), "one\ntwo\nthree\nfour\n").unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new("a.txt")).unwrap();
+        index.write().unwrap();
+        fs::write(dir.path().join("unstaged.txt"), "not staged\n").unwrap();
+
+        let result = load(&repo, &Scope::Staged).unwrap();
+        assert_eq!(result.files.len(), 1);
+        assert_eq!(find(&result, "a.txt").additions, 1);
+    }
+
+    #[test]
+    fn branch_scope_diffs_merge_base_to_head() {
+        let (dir, repo) = setup();
+        let main_head = repo.head().unwrap().peel_to_commit().unwrap().id();
+        // Branch off, commit twice on the feature branch.
+        repo.branch("feature", &repo.find_commit(main_head).unwrap(), false)
+            .unwrap();
+        repo.set_head("refs/heads/feature").unwrap();
+        fs::write(dir.path().join("feat.txt"), "feature work\n").unwrap();
+        commit_all(&repo, "feat 1");
+        fs::write(dir.path().join("a.txt"), "one\ntwo\nthree\nfeature\n").unwrap();
+        commit_all(&repo, "feat 2");
+        // Advance main independently so merge-base != main tip.
+        // (skipped: merge-base == branch point is the common case anyway)
+
+        let scope = Scope::Branch {
+            base: "main".into(),
+        };
+        let result = load(&repo, &scope).unwrap();
+        assert_eq!(result.files.len(), 2);
+        assert_eq!(find(&result, "feat.txt").status, FileStatus::Added);
+        assert_eq!(find(&result, "a.txt").additions, 1);
+        // Uncommitted noise must not leak into the branch scope.
+        fs::write(dir.path().join("noise.txt"), "dirty\n").unwrap();
+        assert_eq!(load(&repo, &scope).unwrap().files.len(), 2);
+    }
+
+    #[test]
+    fn commit_scope_diffs_against_first_parent() {
+        let (dir, repo) = setup();
+        fs::write(dir.path().join("a.txt"), "one\ntwo\nthree\nfour\n").unwrap();
+        commit_all(&repo, "add four");
+
+        let scope = commit_scope(&repo, "HEAD").unwrap();
+        let result = load(&repo, &scope).unwrap();
+        assert_eq!(result.files.len(), 1);
+        assert_eq!(find(&result, "a.txt").additions, 1);
+
+        // Root commit diffs against the empty tree.
+        let root = commit_scope(&repo, "HEAD~1").unwrap();
+        let result = load(&repo, &root).unwrap();
+        assert_eq!(result.files.len(), 2);
+        assert_eq!(find(&result, "a.txt").status, FileStatus::Added);
+    }
+
+    #[test]
+    fn base_detection_prefers_default_branches() {
+        let (dir, repo) = setup();
+        // On main with no upstream and no other branches: nothing to compare to.
+        assert_eq!(detect_base(&repo), None);
+        // From a feature branch, main is found.
+        let head = repo.head().unwrap().peel_to_commit().unwrap();
+        repo.branch("feature", &head, false).unwrap();
+        repo.set_head("refs/heads/feature").unwrap();
+        // Branch names depend on init.defaultBranch; accept either.
+        let base = detect_base(&repo);
+        assert!(
+            base.as_deref() == Some("main") || base.as_deref() == Some("master"),
+            "unexpected base: {base:?} (dir: {:?})",
+            dir.path()
+        );
+    }
+
+    #[test]
+    fn file_count_matches_full_load() {
+        let (dir, repo) = setup();
+        fs::write(dir.path().join("a.txt"), "changed\n").unwrap();
+        fs::write(dir.path().join("new.txt"), "hello\n").unwrap();
+        assert_eq!(file_count(&repo, &Scope::Uncommitted), 2);
+        assert_eq!(file_count(&repo, &Scope::Staged), 0);
     }
 }

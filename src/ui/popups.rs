@@ -2,16 +2,19 @@ use ratatui::prelude::*;
 use ratatui::widgets::{Block, BorderType, Clear, Paragraph};
 
 const HELP: &[(&str, &str)] = &[
-    ("↑↓ / j k", "scroll diff (or move in file tree)"),
+    ("1-9", "picker: open that entry"),
+    ("↑↓ / j k", "scroll diff (or move in a list)"),
     ("PgUp PgDn / ⌃u ⌃d", "scroll a page"),
     ("g / G", "jump to top / bottom"),
     ("] / [", "next / previous file"),
     ("n / p", "next / previous hunk"),
     ("Tab", "switch focus between tree and diff"),
-    ("⏎", "tree: open file in diff / toggle directory"),
+    ("⏎", "open the selected file / entry"),
     ("t", "show / hide the file tree"),
+    ("x", "switch scope (back to the picker)"),
     ("?", "toggle this help"),
-    ("q / Esc", "quit (or close this popup)"),
+    ("q / Esc", "back; quits from the picker"),
+    ("⌃c", "quit from anywhere"),
 ];
 
 pub fn render_help(frame: &mut Frame, area: Rect) {
