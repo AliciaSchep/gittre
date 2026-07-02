@@ -66,6 +66,30 @@ pub fn detect_base(repo: &Repository) -> Option<String> {
         .map(|&name| name.to_string())
 }
 
+/// Candidate review bases: every local and remote branch except the current
+/// one, locals first. Used when no base could be auto-detected.
+pub fn base_candidates(repo: &Repository) -> Vec<String> {
+    let current = repo
+        .head()
+        .ok()
+        .and_then(|h| h.shorthand().ok().map(str::to_owned));
+    let mut names = Vec::new();
+    for branch_type in [git2::BranchType::Local, git2::BranchType::Remote] {
+        let Ok(branches) = repo.branches(Some(branch_type)) else {
+            continue;
+        };
+        for branch in branches.flatten() {
+            let (branch, _) = branch;
+            if let Ok(Some(name)) = branch.name() {
+                if Some(name) != current.as_deref() && !name.ends_with("/HEAD") {
+                    names.push(name.to_string());
+                }
+            }
+        }
+    }
+    names
+}
+
 /// Build the raw git2 diff for a scope. Shared by the full loader (which walks
 /// content) and the picker's file counts (which only look at deltas).
 pub fn build_diff<'r>(repo: &'r Repository, scope: &Scope) -> Result<git2::Diff<'r>> {

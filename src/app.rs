@@ -9,8 +9,8 @@ use ratatui::widgets::Paragraph;
 
 use crate::git::diff::{self, DiffResult};
 use crate::git::log::commit_log;
-use crate::git::scope::{Scope, detect_base, file_count};
-use crate::ui::picker::{LogPicker, ScopeAction, ScopeItem, ScopePicker};
+use crate::git::scope::{Scope, base_candidates, detect_base, file_count};
+use crate::ui::picker::{BasePicker, LogPicker, ScopeAction, ScopeItem, ScopePicker};
 use crate::ui::review::Stream;
 use crate::ui::tree::FileTree;
 use crate::ui::{bar, popups};
@@ -48,6 +48,7 @@ impl ReviewState {
 enum Screen {
     Picker(ScopePicker),
     Log(LogPicker),
+    Base(BasePicker),
     Review(Box<ReviewState>),
 }
 
@@ -107,6 +108,7 @@ impl App {
         match &mut self.screen {
             Screen::Picker(picker) => picker.render(frame, main_area),
             Screen::Log(log) => log.render(frame, main_area),
+            Screen::Base(base) => base.render(frame, main_area),
             Screen::Review(review) => draw_review(review, frame, main_area),
         }
 
@@ -125,9 +127,10 @@ impl App {
             match &self.screen {
                 Screen::Picker(_) => spans.push(" select what to review".dark_gray()),
                 Screen::Log(_) => spans.push(" pick a commit to review".dark_gray()),
+                Screen::Base(_) => spans.push(" pick a base branch".dark_gray()),
                 Screen::Review(r) => {
                     spans.push(format!(" {}", r.scope.label()).bold());
-                    spans.push(format!("  {} files ", r.diff.files.len()).into());
+                    spans.push(format!("  {} ", count_label(r.diff.files.len())).into());
                     spans.push(format!("+{} ", r.diff.additions).green());
                     spans.push(format!("−{}", r.diff.deletions).red());
                 }
@@ -154,6 +157,12 @@ impl App {
             Screen::Log(_) => vec![
                 ("↑↓/jk", "select"),
                 ("⏎", "review commit"),
+                ("q/Esc", "back"),
+                ("?", "help"),
+            ],
+            Screen::Base(_) => vec![
+                ("↑↓/jk", "select"),
+                ("⏎", "compare against"),
                 ("q/Esc", "back"),
                 ("?", "help"),
             ],
@@ -209,6 +218,7 @@ impl App {
         match &mut self.screen {
             Screen::Picker(_) => self.on_picker_key(code),
             Screen::Log(_) => self.on_log_key(code),
+            Screen::Base(_) => self.on_base_key(code),
             Screen::Review(_) => self.on_review_key(code, modifiers),
         }
     }
@@ -244,6 +254,7 @@ impl App {
             match &item.action {
                 ScopeAction::Open(scope) => ScopeAction::Open(scope.clone()),
                 ScopeAction::PickCommit => ScopeAction::PickCommit,
+                ScopeAction::PickBase => ScopeAction::PickBase,
             }
         };
         match action {
@@ -260,6 +271,37 @@ impl App {
                 }
                 Err(e) => self.error = Some(format!("{e:#}")),
             },
+            ScopeAction::PickBase => {
+                let names = base_candidates(&self.repo);
+                if names.is_empty() {
+                    self.error =
+                        Some("only one branch and no upstream — nothing to compare".into());
+                } else {
+                    self.screen = Screen::Base(BasePicker { names, selected: 0 });
+                }
+            }
+        }
+    }
+
+    fn on_base_key(&mut self, code: KeyCode) {
+        let Screen::Base(base) = &mut self.screen else {
+            return;
+        };
+        match code {
+            KeyCode::Char('q') | KeyCode::Esc => self.open_picker(),
+            KeyCode::Char('j') | KeyCode::Down => base.move_selection(1),
+            KeyCode::Char('k') | KeyCode::Up => base.move_selection(-1),
+            KeyCode::PageDown => base.move_selection(20),
+            KeyCode::PageUp => base.move_selection(-20),
+            KeyCode::Char('g') | KeyCode::Home => base.selected = 0,
+            KeyCode::Char('G') | KeyCode::End => base.selected = base.names.len().saturating_sub(1),
+            KeyCode::Enter => {
+                if let Some(name) = base.names.get(base.selected) {
+                    let scope = Scope::Branch { base: name.clone() };
+                    self.open_scope(scope);
+                }
+            }
+            _ => {}
         }
     }
 
@@ -415,13 +457,21 @@ fn build_picker(repo: &Repository) -> ScopePicker {
             action: ScopeAction::Open(Scope::Staged),
         },
     ];
-    if let Some(base) = detect_base(repo) {
-        let scope = Scope::Branch { base: base.clone() };
-        items.push(ScopeItem {
-            title: format!("Branch vs {base}"),
-            detail: count_label(file_count(repo, &scope)),
-            action: ScopeAction::Open(scope),
-        });
+    match detect_base(repo) {
+        Some(base) => {
+            let scope = Scope::Branch { base: base.clone() };
+            items.push(ScopeItem {
+                title: format!("Branch vs {base}"),
+                detail: count_label(file_count(repo, &scope)),
+                action: ScopeAction::Open(scope),
+            });
+        }
+        // Always show the entry; explain instead of silently hiding it.
+        None => items.push(ScopeItem {
+            title: "Branch vs a base you pick…".into(),
+            detail: "no base auto-detected".into(),
+            action: ScopeAction::PickBase,
+        }),
     }
     items.push(ScopeItem {
         title: "A specific commit…".into(),

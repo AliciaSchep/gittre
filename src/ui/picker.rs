@@ -8,6 +8,8 @@ use crate::git::scope::Scope;
 pub enum ScopeAction {
     Open(Scope),
     PickCommit,
+    /// No base was auto-detected: choose one from the branch list.
+    PickBase,
 }
 
 pub struct ScopeItem {
@@ -69,6 +71,34 @@ impl ScopePicker {
             .highlight_style(Style::new().reversed());
         let mut state = ListState::default().with_selected(Some(self.selected));
         frame.render_stateful_widget(list, popup, &mut state);
+    }
+}
+
+/// Branch list: pick a base to diff the current branch against.
+pub struct BasePicker {
+    pub names: Vec<String>,
+    pub selected: usize,
+}
+
+impl BasePicker {
+    pub fn move_selection(&mut self, delta: isize) {
+        let len = self.names.len() as isize;
+        if len > 0 {
+            self.selected = (self.selected as isize + delta).clamp(0, len - 1) as usize;
+        }
+    }
+
+    pub fn render(&self, frame: &mut Frame, area: Rect) {
+        let items: Vec<ListItem> = self
+            .names
+            .iter()
+            .map(|name| ListItem::new(Line::from(format!(" {name}"))))
+            .collect();
+        let list = List::new(items)
+            .block(Block::new().title(Line::from(" pick a base to compare against ".bold())))
+            .highlight_style(Style::new().reversed());
+        let mut state = ListState::default().with_selected(Some(self.selected));
+        frame.render_stateful_widget(list, area, &mut state);
     }
 }
 
