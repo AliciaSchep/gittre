@@ -161,15 +161,22 @@ impl App {
                 if review.diff.files.is_empty() {
                     return vec![("x/q", "switch scope"), ("?", "help")];
                 }
-                let mut hints: Vec<(&str, &str)> = vec![("↑↓/jk", "scroll")];
                 if review.focus == Focus::Tree {
-                    hints.push(("⏎", "open"));
+                    return vec![
+                        ("↑↓/jk", "select"),
+                        ("⏎", "open"),
+                        ("Esc/Tab", "back to diff"),
+                        ("x/q", "scope"),
+                        ("?", "help"),
+                    ];
                 }
-                hints.extend([("]/[", "file"), ("n/p", "hunk")]);
+                let mut hints: Vec<(&str, &str)> =
+                    vec![("↑↓/jk", "scroll"), ("]/[", "file"), ("n/p", "hunk")];
                 if review.show_tree {
-                    hints.push(("Tab", "focus"));
+                    hints.push(("Tab", "pick file"));
                     hints.push(("t", "hide tree"));
                 } else {
+                    hints.push(("Tab", "pick file"));
                     hints.push(("t", "show tree"));
                 }
                 hints.extend([("x/q", "scope"), ("?", "help")]);
@@ -286,6 +293,11 @@ impl App {
             return;
         };
         match code {
+            // Esc first backs out of an active tree pick, then leaves the review.
+            KeyCode::Esc if review.focus == Focus::Tree => {
+                review.focus = Focus::Stream;
+                sync_tree(review);
+            }
             KeyCode::Char('q') | KeyCode::Esc | KeyCode::Char('x') => self.open_picker(),
             KeyCode::Char('t') => {
                 review.show_tree = !review.show_tree;
@@ -301,6 +313,14 @@ impl App {
                     Focus::Tree => Focus::Stream,
                     Focus::Stream => Focus::Tree,
                 };
+                // Start the pick from the file being read, not row zero.
+                if review.focus == Focus::Tree {
+                    if let Some(fi) = review.stream.current_file() {
+                        review.tree.select_file(fi);
+                    }
+                } else {
+                    sync_tree(review);
+                }
             }
             KeyCode::Char('j') | KeyCode::Down => match review.focus {
                 Focus::Tree => review.tree.move_selection(1),
@@ -448,7 +468,11 @@ fn draw_review(review: &ReviewState, frame: &mut Frame, area: Rect) {
 }
 
 /// Keep the tree highlight in sync with the file at the top of the stream.
+/// Passive-mode only: never fights the user while they're picking in the tree.
 fn sync_tree(review: &mut ReviewState) {
+    if review.focus == Focus::Tree {
+        return;
+    }
     if let Some(fi) = review.stream.current_file() {
         review.tree.select_file(fi);
     }

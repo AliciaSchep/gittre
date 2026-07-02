@@ -133,15 +133,18 @@ impl FileTree {
     }
 
     pub fn render(&self, frame: &mut Frame, area: Rect, focused: bool) {
-        let border_style = if focused {
-            Style::new().cyan()
+        let (border_style, title) = if focused {
+            (
+                Style::new().cyan(),
+                Line::from(vec![" Files ".bold().black().on_cyan(), " ⏎ open ".cyan()]),
+            )
         } else {
-            Style::new().dark_gray()
+            (Style::new().dark_gray(), Line::from(" Files ".dark_gray()))
         };
         let block = Block::new()
             .borders(Borders::RIGHT)
             .border_style(border_style)
-            .title(Line::from(" Files ".bold()));
+            .title(title);
 
         let items: Vec<ListItem> = self
             .visible()
@@ -167,10 +170,12 @@ impl FileTree {
             })
             .collect();
 
+        // Active: bright selection bar for picking. Passive: a dim
+        // "you are here" marker that follows the diff as it scrolls.
         let highlight = if focused {
-            Style::new().reversed()
+            Style::new().black().on_cyan().bold()
         } else {
-            Style::new().bold().on_dark_gray()
+            Style::new().on_dark_gray()
         };
         let list = List::new(items).block(block).highlight_style(highlight);
         let mut state = ListState::default().with_selected(Some(self.selected));

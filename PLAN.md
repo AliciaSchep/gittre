@@ -78,8 +78,11 @@ Running `gittre` in a repo opens the **scope picker** — a simple menu, no flag
   Sticky header shows the current file. `]`/`[` jump between files,
   `n`/`p` between hunks.
 - **Left pane: file tree.** Directory tree of changed files with status letters
-  (M/A/D/R). `t` toggles it, `Tab` moves focus, `Enter` jumps the stream to the
-  selected file. Collapsible directories.
+  (M/A/D/R), in the same order the stream scrolls through them. Normally
+  passive — a "you are here" marker follows the diff. `Tab` activates it as a
+  jump menu (selection seeded from the current file): `j/k` select, `Enter`
+  opens a file (or toggles a directory), `Esc` cancels; control returns to the
+  diff after a jump. `t` hides/shows the pane.
 - **Bottom command bar** always lists the actions valid *right now* (gitui's
   signature pattern). It changes with focus/mode; `?` opens a full help popup.
 - `s` toggles unified ↔ side-by-side (side-by-side only when the terminal is

@@ -153,6 +153,10 @@ fn collect(diff: &git2::Diff) -> Result<DiffResult> {
     .context("walking diff")?;
 
     let mut result = result.into_inner();
+    // Match the file tree's visual order (directories first, then files,
+    // alphabetical at each level) so scrolling the stream and walking the
+    // tree traverse files in the same sequence.
+    result.files.sort_by(|a, b| tree_order(&a.path, &b.path));
     let (adds, dels) = result
         .files
         .iter()
@@ -160,6 +164,32 @@ fn collect(diff: &git2::Diff) -> Result<DiffResult> {
     result.additions = adds;
     result.deletions = dels;
     Ok(result)
+}
+
+fn tree_order(a: &str, b: &str) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let ac: Vec<&str> = a.split('/').collect();
+    let bc: Vec<&str> = b.split('/').collect();
+    for i in 0.. {
+        match (ac.get(i), bc.get(i)) {
+            (Some(x), Some(y)) => {
+                let a_dir = i + 1 < ac.len();
+                let b_dir = i + 1 < bc.len();
+                match (a_dir, b_dir) {
+                    (true, false) => return Ordering::Less,
+                    (false, true) => return Ordering::Greater,
+                    _ => match x.cmp(y) {
+                        Ordering::Equal => continue,
+                        other => return other,
+                    },
+                }
+            }
+            (None, None) => return Ordering::Equal,
+            (None, Some(_)) => return Ordering::Less,
+            (Some(_), None) => return Ordering::Greater,
+        }
+    }
+    unreachable!()
 }
 
 #[cfg(test)]
@@ -335,6 +365,29 @@ mod tests {
             "unexpected base: {base:?} (dir: {:?})",
             dir.path()
         );
+    }
+
+    #[test]
+    fn files_come_in_tree_order() {
+        use std::cmp::Ordering;
+        let paths = [
+            "zeta/a.txt",     // dirs before root files, "zeta" after "docs"
+            "docs/readme.md", // within docs: sub/ before files
+            "docs/sub/x.txt",
+            "a_root_file.txt",
+        ];
+        let mut sorted: Vec<&str> = paths.to_vec();
+        sorted.sort_by(|a, b| tree_order(a, b));
+        assert_eq!(
+            sorted,
+            [
+                "docs/sub/x.txt",
+                "docs/readme.md",
+                "zeta/a.txt",
+                "a_root_file.txt",
+            ]
+        );
+        assert_eq!(tree_order("a.txt", "a.txt"), Ordering::Equal);
     }
 
     #[test]
