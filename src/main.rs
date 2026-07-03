@@ -1,6 +1,8 @@
 mod app;
+mod event;
 mod git;
 mod ui;
+mod watch;
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;

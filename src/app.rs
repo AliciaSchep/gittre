@@ -1,4 +1,5 @@
-use std::time::Duration;
+use std::sync::mpsc::{Receiver, Sender, channel};
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use git2::Repository;
@@ -7,6 +8,7 @@ use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers
 use ratatui::prelude::*;
 use ratatui::widgets::Paragraph;
 
+use crate::event::{AppEvent, spawn_loader};
 use crate::git::diff::{self, DiffResult};
 use crate::git::log::commit_log;
 use crate::git::scope::{Scope, base_candidates, detect_base, file_count};
@@ -14,6 +16,7 @@ use crate::ui::picker::{BasePicker, LogPicker, ScopeAction, ScopeItem, ScopePick
 use crate::ui::review::Stream;
 use crate::ui::tree::FileTree;
 use crate::ui::{bar, popups};
+use crate::watch::{self, RepoWatcher};
 
 #[derive(PartialEq, Clone, Copy)]
 enum Focus {
@@ -58,6 +61,13 @@ pub struct App {
     show_help: bool,
     error: Option<String>,
     quit: bool,
+    events: Receiver<AppEvent>,
+    loader: Sender<(u64, Scope)>,
+    _watcher: Option<RepoWatcher>,
+    /// Monotonic id pairing reload requests with responses.
+    seq: u64,
+    reloading: bool,
+    reloaded_at: Option<Instant>,
 }
 
 const TREE_WIDTH: u16 = 32;
@@ -70,27 +80,75 @@ impl App {
             Some((scope, diff)) => Screen::Review(Box::new(ReviewState::new(scope, diff))),
             None => Screen::Picker(build_picker(&repo)),
         };
+        let (event_tx, events) = channel();
+        let loader_path = repo.workdir().unwrap_or_else(|| repo.path()).to_path_buf();
+        let loader = spawn_loader(loader_path, event_tx.clone());
+        let watcher = watch::spawn(&repo, event_tx);
         App {
             repo,
             screen,
             show_help: false,
             error: None,
             quit: false,
+            events,
+            loader,
+            _watcher: watcher,
+            seq: 0,
+            reloading: false,
+            reloaded_at: None,
         }
     }
 
     pub fn run(mut self, terminal: &mut DefaultTerminal) -> Result<()> {
         while !self.quit {
             terminal.draw(|frame| self.draw(frame))?;
-            if event::poll(Duration::from_millis(250))? {
+            if event::poll(Duration::from_millis(100))? {
                 if let Event::Key(key) = event::read()? {
                     if key.kind == KeyEventKind::Press {
                         self.on_key(key.code, key.modifiers);
                     }
                 }
             }
+            while let Ok(app_event) = self.events.try_recv() {
+                self.on_app_event(app_event);
+            }
         }
         Ok(())
+    }
+
+    fn on_app_event(&mut self, event: AppEvent) {
+        match event {
+            AppEvent::RepoChanged => match &self.screen {
+                Screen::Review(review) => {
+                    self.seq += 1;
+                    self.reloading = true;
+                    let _ = self.loader.send((self.seq, review.scope.clone()));
+                }
+                // Keep the picker's counts fresh too.
+                Screen::Picker(picker) => {
+                    let selected = picker.selected;
+                    let mut rebuilt = build_picker(&self.repo);
+                    rebuilt.selected = selected.min(rebuilt.items.len().saturating_sub(1));
+                    self.screen = Screen::Picker(rebuilt);
+                }
+                _ => {}
+            },
+            AppEvent::DiffLoaded { seq, diff } => {
+                if seq != self.seq {
+                    return; // superseded by a newer request or scope switch
+                }
+                self.reloading = false;
+                if let Screen::Review(review) = &mut self.screen {
+                    match diff {
+                        Ok(diff) => {
+                            apply_reload(review, diff);
+                            self.reloaded_at = Some(Instant::now());
+                        }
+                        Err(e) => self.error = Some(format!("{e:#}")),
+                    }
+                }
+            }
+        }
     }
 
     // ---- drawing ----------------------------------------------------------
@@ -133,6 +191,14 @@ impl App {
                     spans.push(format!("  {} ", count_label(r.diff.files.len())).into());
                     spans.push(format!("+{} ", r.diff.additions).green());
                     spans.push(format!("−{}", r.diff.deletions).red());
+                    if self.reloading {
+                        spans.push("  ↻ reloading…".dark_gray());
+                    } else if self
+                        .reloaded_at
+                        .is_some_and(|t| t.elapsed() < Duration::from_millis(1500))
+                    {
+                        spans.push("  ↻ reloaded".dark_gray());
+                    }
                 }
             }
         }
@@ -425,6 +491,8 @@ impl App {
     // ---- transitions ------------------------------------------------------
 
     fn open_scope(&mut self, scope: Scope) {
+        self.seq += 1; // invalidate any in-flight reload
+        self.reloading = false;
         match diff::load(&self.repo, &scope) {
             Ok(diff) => self.screen = Screen::Review(Box::new(ReviewState::new(scope, diff))),
             Err(e) => self.error = Some(format!("{e:#}")),
@@ -514,6 +582,29 @@ fn draw_review(review: &ReviewState, frame: &mut Frame, area: Rect) {
         );
     } else {
         review.stream.render(frame, area, &review.diff.files, true);
+    }
+}
+
+/// Swap in a freshly loaded diff, preserving the reader's position (by file
+/// path + offset), the tree's fold state, and focus.
+fn apply_reload(review: &mut ReviewState, diff: DiffResult) {
+    let anchor = review.stream.anchor(&review.diff.files);
+    let collapsed = review.tree.collapsed_dirs();
+
+    review.diff = diff;
+    review.stream = Stream::new(&review.diff);
+    review.tree = FileTree::new(&review.diff.files);
+    review.tree.apply_collapsed(&collapsed);
+    if let Some(anchor) = &anchor {
+        review.stream.restore(anchor, &review.diff.files);
+    }
+    if review.focus == Focus::Tree {
+        // Re-seed the pick from wherever the reader is.
+        if let Some(fi) = review.stream.current_file() {
+            review.tree.select_file(fi);
+        }
+    } else {
+        sync_tree(review);
     }
 }
 

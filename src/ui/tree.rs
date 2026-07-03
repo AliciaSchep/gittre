@@ -115,6 +115,49 @@ impl FileTree {
         }
     }
 
+    /// Slash-joined paths of collapsed directories, for carrying fold state
+    /// across a reload.
+    pub fn collapsed_dirs(&self) -> std::collections::HashSet<String> {
+        let mut out = std::collections::HashSet::new();
+        fn walk(node: &Node, prefix: &str, out: &mut std::collections::HashSet<String>) {
+            for child in &node.children {
+                if child.file.is_none() {
+                    let path = if prefix.is_empty() {
+                        child.name.clone()
+                    } else {
+                        format!("{prefix}/{}", child.name)
+                    };
+                    if !child.expanded {
+                        out.insert(path.clone());
+                    }
+                    walk(child, &path, out);
+                }
+            }
+        }
+        walk(&self.root, "", &mut out);
+        out
+    }
+
+    pub fn apply_collapsed(&mut self, collapsed: &std::collections::HashSet<String>) {
+        fn walk(node: &mut Node, prefix: &str, collapsed: &std::collections::HashSet<String>) {
+            for child in &mut node.children {
+                if child.file.is_none() {
+                    let path = if prefix.is_empty() {
+                        child.name.clone()
+                    } else {
+                        format!("{prefix}/{}", child.name)
+                    };
+                    if collapsed.contains(&path) {
+                        child.expanded = false;
+                    }
+                    walk(child, &path, collapsed);
+                }
+            }
+        }
+        walk(&mut self.root, "", collapsed);
+        self.selected = self.selected.min(self.len().saturating_sub(1));
+    }
+
     /// Child-index path from the root to the selected visible node.
     fn selected_path(&self) -> Option<Vec<usize>> {
         let mut paths = Vec::new();

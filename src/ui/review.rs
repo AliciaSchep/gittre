@@ -90,6 +90,30 @@ impl Stream {
         }
     }
 
+    /// Where the reader is, expressed as (file path, rows below its header) —
+    /// stable across reloads even when other files grow or shrink.
+    pub fn anchor(&self, files: &[FileDiff]) -> Option<(String, usize)> {
+        let fi = self.current_file()?;
+        let rel = self.scroll - self.file_starts[fi];
+        Some((files[fi].path.clone(), rel))
+    }
+
+    /// Re-apply an anchor after the diff was rebuilt. Falls back to clamping
+    /// when the anchored file disappeared from the new diff.
+    pub fn restore(&mut self, anchor: &(String, usize), files: &[FileDiff]) {
+        let (path, rel) = anchor;
+        if let Some(fi) = files.iter().position(|f| &f.path == path) {
+            let start = self.file_starts[fi];
+            let end = self
+                .file_starts
+                .get(fi + 1)
+                .copied()
+                .unwrap_or(self.rows.len());
+            self.scroll = (start + rel).min(end.saturating_sub(1));
+        }
+        self.scroll = self.scroll.min(self.scroll_limit());
+    }
+
     /// Index of the file whose content is at the top of the viewport.
     pub fn current_file(&self) -> Option<usize> {
         if self.file_starts.is_empty() {
@@ -155,6 +179,11 @@ impl Stream {
         frame.render_widget(Paragraph::new(visible), inner);
     }
 
+    #[cfg(test)]
+    fn set_viewport(&self, height: usize) {
+        self.viewport.set(height);
+    }
+
     fn render_row(&self, row: &Row, files: &[FileDiff], width: u16) -> Line<'static> {
         match *row {
             Row::Spacer => Line::default(),
@@ -199,5 +228,74 @@ impl Stream {
                 Line::from(vec![gutter.dark_gray(), styled_body])
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::git::diff::{DiffLine, DiffResult, FileDiff, FileStatus, Hunk};
+
+    fn file(path: &str, lines: usize) -> FileDiff {
+        FileDiff {
+            path: path.into(),
+            old_path: None,
+            status: FileStatus::Modified,
+            binary: false,
+            hunks: vec![Hunk {
+                header: "@@ @@".into(),
+                lines: (0..lines)
+                    .map(|i| DiffLine {
+                        origin: '+',
+                        old_lineno: None,
+                        new_lineno: Some(i as u32 + 1),
+                        content: format!("line {i}"),
+                    })
+                    .collect(),
+            }],
+            additions: lines,
+            deletions: 0,
+        }
+    }
+
+    fn diff(specs: &[(&str, usize)]) -> DiffResult {
+        DiffResult {
+            files: specs.iter().map(|(p, n)| file(p, *n)).collect(),
+            additions: 0,
+            deletions: 0,
+        }
+    }
+
+    #[test]
+    fn anchor_survives_growth_of_earlier_files() {
+        let before = diff(&[("a.txt", 3), ("b.txt", 5)]);
+        let mut stream = Stream::new(&before);
+        stream.set_viewport(4);
+        stream.jump_to_file(1);
+        stream.scroll_by(2); // two rows into b.txt
+        let anchor = stream.anchor(&before.files).unwrap();
+        assert_eq!(anchor.0, "b.txt");
+
+        // a.txt grows by 10 lines; b.txt's rows all shift down.
+        let after = diff(&[("a.txt", 13), ("b.txt", 5)]);
+        let mut stream = Stream::new(&after);
+        stream.set_viewport(4);
+        stream.restore(&anchor, &after.files);
+        assert_eq!(stream.current_file(), Some(1), "still reading b.txt");
+    }
+
+    #[test]
+    fn anchor_of_vanished_file_clamps_safely() {
+        let before = diff(&[("a.txt", 3), ("b.txt", 40)]);
+        let mut stream = Stream::new(&before);
+        stream.set_viewport(4);
+        stream.scroll_to_bottom();
+        let anchor = stream.anchor(&before.files).unwrap();
+
+        let after = diff(&[("a.txt", 3)]);
+        let mut stream = Stream::new(&after);
+        stream.set_viewport(4);
+        stream.restore(&anchor, &after.files);
+        assert!(stream.scroll < 6, "scroll clamped into the smaller diff");
     }
 }
