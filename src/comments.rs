@@ -23,14 +23,18 @@ pub struct Comment {
     pub created_at: u64,
     /// Scope label at creation time; metadata for export only.
     pub scope: String,
+    /// Set when the last re-anchor failed; the snippet preserves context.
+    #[serde(default)]
+    pub outdated: bool,
 }
 
 /// What a comment anchors to in the currently displayed diff.
 pub enum Anchor {
     /// After this (hunk, line) of the file.
     Line { hunk: usize, line: usize },
-    /// File is in the diff but the anchor lines are not: show at file top.
-    FileTop,
+    /// Re-anchoring failed: shown at the top of the file's section with the
+    /// preserved snippet as context (GitHub's "outdated" state).
+    Outdated,
 }
 
 pub struct Placed {
@@ -39,36 +43,92 @@ pub struct Placed {
     pub anchor: Anchor,
 }
 
-/// Anchor each comment against the diff. Comments whose file isn't in the
-/// diff at all are simply not placed (they remain in the store and export).
-pub fn place(diff: &DiffResult, comments: &[Comment]) -> Vec<Placed> {
+/// Strip the +/-/space sign a snippet line was stored with.
+fn snippet_text(line: &str) -> &str {
+    line.strip_prefix(['+', '-', ' ']).unwrap_or(line)
+}
+
+/// Anchor each comment against the diff with a GitHub-style cascade:
+/// exact (anchor line still has the snippet content) → moved (same content
+/// found elsewhere in the file's diff; stored lines updated) → outdated.
+/// Comments whose file isn't in the diff at all are simply not placed (they
+/// remain in the store and export). Returns placements and whether any
+/// comment was mutated (moved or outdated-flag changed) and needs saving.
+pub fn reanchor(diff: &DiffResult, comments: &mut [Comment]) -> (Vec<Placed>, bool) {
     let mut placed = Vec::new();
-    for (ci, comment) in comments.iter().enumerate() {
+    let mut changed = false;
+    for (ci, comment) in comments.iter_mut().enumerate() {
         let Some(fi) = diff.files.iter().position(|f| f.path == comment.path) else {
             continue;
         };
         let file = &diff.files[fi];
-        let mut anchor = Anchor::FileTop;
-        'hunks: for (hi, hunk) in file.hunks.iter().enumerate() {
+        // The anchor line's expected content, from the preserved snippet.
+        let target = comment
+            .snippet
+            .last()
+            .map(|l| snippet_text(l))
+            .unwrap_or("");
+
+        // Every diff line of this file on the comment's side.
+        let mut candidates: Vec<(u32, usize, usize, &str)> = Vec::new(); // (lineno, hunk, line, content)
+        for (hi, hunk) in file.hunks.iter().enumerate() {
             for (li, line) in hunk.lines.iter().enumerate() {
                 let lineno = if comment.new_side {
                     line.new_lineno
                 } else {
                     line.old_lineno
                 };
-                if lineno == Some(comment.lines.1) {
-                    anchor = Anchor::Line { hunk: hi, line: li };
-                    break 'hunks;
+                if let Some(n) = lineno {
+                    candidates.push((n, hi, li, line.content.as_str()));
                 }
             }
         }
+
+        // 1. Exact: stored line number still carries the snippet content.
+        let exact = candidates
+            .iter()
+            .find(|(n, _, _, c)| *n == comment.lines.1 && *c == target);
+        // 2. Moved: same content elsewhere; nearest occurrence wins.
+        //    Blank targets match too promiscuously to be trusted.
+        let hit = exact.or_else(|| {
+            if target.trim().is_empty() {
+                return None;
+            }
+            candidates
+                .iter()
+                .filter(|(_, _, _, c)| *c == target)
+                .min_by_key(|(n, _, _, _)| n.abs_diff(comment.lines.1))
+        });
+
+        let anchor = match hit {
+            Some(&(n, hi, li, _)) => {
+                if n != comment.lines.1 {
+                    let delta = i64::from(n) - i64::from(comment.lines.1);
+                    comment.lines.0 = (i64::from(comment.lines.0) + delta).max(1) as u32;
+                    comment.lines.1 = n;
+                    changed = true;
+                }
+                if comment.outdated {
+                    comment.outdated = false;
+                    changed = true;
+                }
+                Anchor::Line { hunk: hi, line: li }
+            }
+            None => {
+                if !comment.outdated {
+                    comment.outdated = true;
+                    changed = true;
+                }
+                Anchor::Outdated
+            }
+        };
         placed.push(Placed {
             comment: ci,
             file: fi,
             anchor,
         });
     }
-    placed
+    (placed, changed)
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -132,6 +192,7 @@ impl CommentStore {
             body,
             created_at: now(),
             scope,
+            outdated: false,
         });
         self.save()
     }
@@ -151,6 +212,16 @@ impl CommentStore {
     pub fn delete_all(&mut self) -> Result<()> {
         self.comments.clear();
         self.save()
+    }
+
+    /// Re-anchor all comments against a diff, persisting any moves or
+    /// outdated-state changes.
+    pub fn reanchor(&mut self, diff: &DiffResult) -> Vec<Placed> {
+        let (placed, changed) = reanchor(diff, &mut self.comments);
+        if changed {
+            let _ = self.save();
+        }
+        placed
     }
 
     pub fn count_for_path(&self, path: &str) -> usize {
@@ -207,31 +278,115 @@ mod tests {
             body: "note".into(),
             created_at: 0,
             scope: "test".into(),
+            outdated: false,
         }
     }
 
     #[test]
-    fn places_on_matching_line() {
+    fn exact_anchor_stays_put() {
         let diff = diff_with("a.rs", &[10, 11, 12]);
-        let placed = place(&diff, &[comment("a.rs", 11)]);
-        assert_eq!(placed.len(), 1);
+        let mut comments = [comment("a.rs", 11)];
+        let (placed, changed) = reanchor(&diff, &mut comments);
         assert!(matches!(
             placed[0].anchor,
             Anchor::Line { hunk: 0, line: 1 }
         ));
+        assert!(!changed);
+        assert_eq!(comments[0].lines, (11, 11));
     }
 
     #[test]
-    fn falls_back_to_file_top_when_line_missing() {
+    fn moved_content_updates_stored_lines() {
+        // "line 11" now lives at line 14 (content is keyed by the snippet).
+        let diff = DiffResult {
+            files: vec![FileDiff {
+                path: "a.rs".into(),
+                old_path: None,
+                status: FileStatus::Modified,
+                binary: false,
+                hunks: vec![Hunk {
+                    header: "@@ @@".into(),
+                    lines: [(13, "line 10"), (14, "line 11"), (15, "line 12")]
+                        .iter()
+                        .map(|&(n, c)| DiffLine {
+                            origin: '+',
+                            old_lineno: None,
+                            new_lineno: Some(n),
+                            content: c.into(),
+                        })
+                        .collect(),
+                }],
+                additions: 3,
+                deletions: 0,
+            }],
+            additions: 0,
+            deletions: 0,
+        };
+        let mut comments = [comment("a.rs", 11)];
+        let (placed, changed) = reanchor(&diff, &mut comments);
+        assert!(matches!(
+            placed[0].anchor,
+            Anchor::Line { hunk: 0, line: 1 }
+        ));
+        assert!(changed);
+        assert_eq!(comments[0].lines, (14, 14), "range shifted with the move");
+        assert!(!comments[0].outdated);
+    }
+
+    #[test]
+    fn vanished_content_goes_outdated_and_can_recover() {
         let diff = diff_with("a.rs", &[10, 11]);
-        let placed = place(&diff, &[comment("a.rs", 99)]);
-        assert!(matches!(placed[0].anchor, Anchor::FileTop));
+        let mut comments = [comment("a.rs", 99)];
+        let (placed, changed) = reanchor(&diff, &mut comments);
+        assert!(matches!(placed[0].anchor, Anchor::Outdated));
+        assert!(changed);
+        assert!(comments[0].outdated);
+
+        // The content comes back: comment recovers to live.
+        let diff = diff_with("a.rs", &[97, 98, 99]);
+        let (placed, changed) = reanchor(&diff, &mut comments);
+        assert!(matches!(placed[0].anchor, Anchor::Line { .. }));
+        assert!(changed, "outdated flag cleared");
+        assert!(!comments[0].outdated);
+    }
+
+    #[test]
+    fn blank_snippet_never_matches_by_content() {
+        let mut c = comment("a.rs", 99);
+        c.snippet = vec!["+".into()];
+        let diff = DiffResult {
+            files: vec![FileDiff {
+                path: "a.rs".into(),
+                old_path: None,
+                status: FileStatus::Modified,
+                binary: false,
+                hunks: vec![Hunk {
+                    header: "@@ @@".into(),
+                    lines: vec![DiffLine {
+                        origin: '+',
+                        old_lineno: None,
+                        new_lineno: Some(5),
+                        content: String::new(),
+                    }],
+                }],
+                additions: 1,
+                deletions: 0,
+            }],
+            additions: 0,
+            deletions: 0,
+        };
+        let mut comments = [c];
+        let (placed, _) = reanchor(&diff, &mut comments);
+        assert!(matches!(placed[0].anchor, Anchor::Outdated));
     }
 
     #[test]
     fn skips_files_not_in_diff() {
         let diff = diff_with("a.rs", &[10]);
-        assert!(place(&diff, &[comment("other.rs", 10)]).is_empty());
+        let mut comments = [comment("other.rs", 10)];
+        let (placed, _) = reanchor(&diff, &mut comments);
+        assert!(placed.is_empty());
+        assert!(!comments[0].outdated, "untouched when file absent");
     }
 
     #[test]

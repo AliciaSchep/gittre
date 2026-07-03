@@ -17,6 +17,8 @@ enum Row {
     Line(usize, usize, usize),
     /// Comment block header; the index is into the comment store slice.
     CommentHeader(usize),
+    /// One preserved-snippet line of an outdated comment.
+    CommentSnippet(usize, usize),
     /// One body line of a comment: (comment index, body line index).
     CommentBody(usize, usize),
 }
@@ -72,7 +74,7 @@ impl Stream {
                     .entry((p.file, hunk, line))
                     .or_default()
                     .push(p.comment),
-                Anchor::FileTop => at_top.entry(p.file).or_default().push(p.comment),
+                Anchor::Outdated => at_top.entry(p.file).or_default().push(p.comment),
             }
         }
 
@@ -80,13 +82,20 @@ impl Stream {
         let mut file_starts = Vec::new();
         let mut hunk_starts = Vec::new();
         let mut comment_starts = Vec::new();
-        let push_comment = |rows: &mut Vec<Row>, starts: &mut Vec<usize>, ci: usize| {
-            starts.push(rows.len());
-            rows.push(Row::CommentHeader(ci));
-            for bi in 0..comments[ci].body.lines().count().max(1) {
-                rows.push(Row::CommentBody(ci, bi));
-            }
-        };
+        let push_comment =
+            |rows: &mut Vec<Row>, starts: &mut Vec<usize>, ci: usize, with_snippet: bool| {
+                starts.push(rows.len());
+                rows.push(Row::CommentHeader(ci));
+                if with_snippet {
+                    // Outdated: the preserved snippet is the only context left.
+                    for si in 0..comments[ci].snippet.len() {
+                        rows.push(Row::CommentSnippet(ci, si));
+                    }
+                }
+                for bi in 0..comments[ci].body.lines().count().max(1) {
+                    rows.push(Row::CommentBody(ci, bi));
+                }
+            };
 
         for (fi, file) in diff.files.iter().enumerate() {
             if fi > 0 {
@@ -96,7 +105,7 @@ impl Stream {
             rows.push(Row::FileHeader(fi));
             if let Some(cs) = at_top.get(&fi) {
                 for &ci in cs {
-                    push_comment(&mut rows, &mut comment_starts, ci);
+                    push_comment(&mut rows, &mut comment_starts, ci, true);
                 }
             }
             if file.binary {
@@ -110,7 +119,7 @@ impl Stream {
                     rows.push(Row::Line(fi, hi, li));
                     if let Some(cs) = at_line.get(&(fi, hi, li)) {
                         for &ci in cs {
-                            push_comment(&mut rows, &mut comment_starts, ci);
+                            push_comment(&mut rows, &mut comment_starts, ci, false);
                         }
                     }
                 }
@@ -196,7 +205,9 @@ impl Stream {
     /// The comment whose block the cursor is on, if any.
     pub fn comment_at_cursor(&self) -> Option<usize> {
         match self.rows.get(self.cursor) {
-            Some(Row::CommentHeader(ci)) | Some(Row::CommentBody(ci, _)) => Some(*ci),
+            Some(Row::CommentHeader(ci))
+            | Some(Row::CommentSnippet(ci, _))
+            | Some(Row::CommentBody(ci, _)) => Some(*ci),
             _ => None,
         }
     }
@@ -691,10 +702,23 @@ impl Stream {
                     format!("L{}-L{}", c.lines.0, c.lines.1)
                 };
                 let side = if c.new_side { "" } else { " (old side)" };
-                Line::from(vec![
-                    "▐ ".cyan(),
-                    format!("✎ #{} · {}{}", c.id, range, side).bold().cyan(),
-                ])
+                if c.outdated {
+                    Line::from(vec![
+                        "▐ ".yellow(),
+                        format!("⚠ #{} · outdated (was {}{})", c.id, range, side)
+                            .bold()
+                            .yellow(),
+                    ])
+                } else {
+                    Line::from(vec![
+                        "▐ ".cyan(),
+                        format!("✎ #{} · {}{}", c.id, range, side).bold().cyan(),
+                    ])
+                }
+            }
+            Row::CommentSnippet(ci, si) => {
+                let text = comments[ci].snippet.get(si).cloned().unwrap_or_default();
+                Line::from(vec!["▐ ".yellow(), text.dark_gray().italic()])
             }
             Row::CommentBody(ci, bi) => {
                 let body = comments[ci].body.lines().nth(bi).unwrap_or("");

@@ -10,7 +10,7 @@ use ratatui::crossterm::event::{
 use ratatui::prelude::*;
 use ratatui::widgets::Paragraph;
 
-use crate::comments::{CommentStore, place};
+use crate::comments::CommentStore;
 use crate::event::{AppEvent, LoadRequest, spawn_loader};
 use crate::git::diff::{self, DiffResult};
 use crate::git::log::commit_log;
@@ -41,8 +41,8 @@ struct ReviewState {
 }
 
 impl ReviewState {
-    fn new(scope: Scope, diff: DiffResult, store: &CommentStore) -> Self {
-        let placed = place(&diff, &store.comments);
+    fn new(scope: Scope, diff: DiffResult, store: &mut CommentStore) -> Self {
+        let placed = store.reanchor(&diff);
         let stream = Stream::new(&diff, &placed, &store.comments);
         let tree = FileTree::new(&diff.files, &comment_counts(&diff, store));
         ReviewState {
@@ -107,9 +107,11 @@ impl App {
     /// `initial`: a scope pre-resolved from CLI flags, already loaded so
     /// errors surface before the terminal is put into raw mode.
     pub fn new(repo: Repository, initial: Option<(Scope, DiffResult)>) -> Self {
-        let store = CommentStore::load(&repo);
+        let mut store = CommentStore::load(&repo);
         let screen = match initial {
-            Some((scope, diff)) => Screen::Review(Box::new(ReviewState::new(scope, diff, &store))),
+            Some((scope, diff)) => {
+                Screen::Review(Box::new(ReviewState::new(scope, diff, &mut store)))
+            }
             None => Screen::Picker(build_picker(&repo)),
         };
         let (event_tx, events) = channel();
@@ -300,7 +302,7 @@ impl App {
                 if let Screen::Review(review) = &mut self.screen {
                     match diff {
                         Ok(diff) => {
-                            apply_reload(review, diff, &self.store);
+                            apply_reload(review, diff, &mut self.store);
                             self.reloaded_at = Some(Instant::now());
                         }
                         Err(e) => self.error = Some(format!("{e:#}")),
@@ -594,7 +596,7 @@ impl App {
         };
         let anchor = review.stream.anchor(&review.diff.files);
         let query = review.stream.search_query();
-        let placed = place(&review.diff, &self.store.comments);
+        let placed = self.store.reanchor(&review.diff);
         review.stream = Stream::new(&review.diff, &placed, &self.store.comments);
         let collapsed = review.tree.collapsed_dirs();
         review.tree = FileTree::new(
@@ -1027,7 +1029,8 @@ impl App {
         self.reloading = false;
         match diff::load(&self.repo, &scope) {
             Ok(diff) => {
-                self.screen = Screen::Review(Box::new(ReviewState::new(scope, diff, &self.store)))
+                self.screen =
+                    Screen::Review(Box::new(ReviewState::new(scope, diff, &mut self.store)))
             }
             Err(e) => self.error = Some(format!("{e:#}")),
         }
@@ -1150,13 +1153,13 @@ fn draw_review(
 
 /// Swap in a freshly loaded diff, preserving the reader's position (by file
 /// path + offset), the tree's fold state, and focus.
-fn apply_reload(review: &mut ReviewState, diff: DiffResult, store: &CommentStore) {
+fn apply_reload(review: &mut ReviewState, diff: DiffResult, store: &mut CommentStore) {
     let anchor = review.stream.anchor(&review.diff.files);
     let collapsed = review.tree.collapsed_dirs();
     let query = review.stream.search_query();
 
     review.diff = diff;
-    let placed = place(&review.diff, &store.comments);
+    let placed = store.reanchor(&review.diff);
     review.stream = Stream::new(&review.diff, &placed, &store.comments);
     review.tree = FileTree::new(&review.diff.files, &comment_counts(&review.diff, store));
     review.tree.apply_collapsed(&collapsed);
