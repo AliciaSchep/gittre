@@ -8,7 +8,7 @@ use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers
 use ratatui::prelude::*;
 use ratatui::widgets::Paragraph;
 
-use crate::event::{AppEvent, spawn_loader};
+use crate::event::{AppEvent, LoadRequest, spawn_loader};
 use crate::git::diff::{self, DiffResult};
 use crate::git::log::commit_log;
 use crate::git::scope::{Scope, base_candidates, detect_base, file_count};
@@ -62,7 +62,7 @@ pub struct App {
     error: Option<String>,
     quit: bool,
     events: Receiver<AppEvent>,
-    loader: Sender<(u64, Scope)>,
+    loader: Sender<LoadRequest>,
     _watcher: Option<RepoWatcher>,
     /// Monotonic id pairing reload requests with responses.
     seq: u64,

@@ -17,11 +17,14 @@ pub enum AppEvent {
     DiffLoaded { seq: u64, diff: Result<DiffResult> },
 }
 
+/// A reload request: (sequence id, scope to re-diff).
+pub type LoadRequest = (u64, Scope);
+
 /// Spawn the background diff loader. git2 handles can't be shared across
 /// threads, so the worker discovers its own from the same path.
-/// Returns the request sender; requests are (seq, scope).
-pub fn spawn_loader(repo_path: PathBuf, events: Sender<AppEvent>) -> Sender<(u64, Scope)> {
-    let (req_tx, req_rx): (Sender<(u64, Scope)>, Receiver<(u64, Scope)>) = channel();
+/// Returns the request sender.
+pub fn spawn_loader(repo_path: PathBuf, events: Sender<AppEvent>) -> Sender<LoadRequest> {
+    let (req_tx, req_rx): (Sender<LoadRequest>, Receiver<LoadRequest>) = channel();
     thread::spawn(move || {
         let Ok(repo) = Repository::discover(&repo_path) else {
             return;
