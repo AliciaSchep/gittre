@@ -14,6 +14,14 @@ enum Row {
     Line(usize, usize, usize),
 }
 
+struct SearchState {
+    query: String,
+    case_sensitive: bool,
+    /// Row indices of matching lines, ascending.
+    matches: Vec<usize>,
+    current: usize,
+}
+
 /// The continuous multi-file diff view.
 pub struct Stream {
     rows: Vec<Row>,
@@ -24,6 +32,7 @@ pub struct Stream {
     pub scroll: usize,
     /// Height of the last rendered viewport, for paging and clamping.
     viewport: Cell<usize>,
+    search: Option<SearchState>,
 }
 
 impl Stream {
@@ -57,6 +66,92 @@ impl Stream {
             hunk_starts,
             scroll: 0,
             viewport: Cell::new(24),
+            search: None,
+        }
+    }
+
+    // ---- search ------------------------------------------------------------
+
+    /// Smart-case: case-sensitive only when the query has an uppercase char.
+    /// Returns the number of matches and jumps to the first one.
+    pub fn set_search(&mut self, query: &str, files: &[FileDiff]) -> usize {
+        let case_sensitive = query.chars().any(|c| c.is_uppercase());
+        let needle = if case_sensitive {
+            query.to_string()
+        } else {
+            query.to_lowercase()
+        };
+        let matches: Vec<usize> = self
+            .rows
+            .iter()
+            .enumerate()
+            .filter_map(|(i, row)| {
+                let Row::Line(fi, hi, li) = *row else {
+                    return None;
+                };
+                let content = &files[fi].hunks[hi].lines[li].content;
+                let hit = if case_sensitive {
+                    content.contains(&needle)
+                } else {
+                    content.to_lowercase().contains(&needle)
+                };
+                hit.then_some(i)
+            })
+            .collect();
+        let count = matches.len();
+        if count == 0 {
+            self.search = None;
+        } else {
+            self.search = Some(SearchState {
+                query: query.to_string(),
+                case_sensitive,
+                matches,
+                current: 0,
+            });
+            self.jump_to_current_match();
+        }
+        count
+    }
+
+    pub fn clear_search(&mut self) {
+        self.search = None;
+    }
+
+    pub fn has_search(&self) -> bool {
+        self.search.is_some()
+    }
+
+    pub fn search_query(&self) -> Option<String> {
+        self.search.as_ref().map(|s| s.query.clone())
+    }
+
+    /// (current 1-based, total, query) for the status display.
+    pub fn search_status(&self) -> Option<(usize, usize, &str)> {
+        self.search
+            .as_ref()
+            .map(|s| (s.current + 1, s.matches.len(), s.query.as_str()))
+    }
+
+    pub fn next_match(&mut self) {
+        if let Some(s) = &mut self.search {
+            s.current = (s.current + 1) % s.matches.len();
+            self.jump_to_current_match();
+        }
+    }
+
+    pub fn prev_match(&mut self) {
+        if let Some(s) = &mut self.search {
+            s.current = (s.current + s.matches.len() - 1) % s.matches.len();
+            self.jump_to_current_match();
+        }
+    }
+
+    fn jump_to_current_match(&mut self) {
+        if let Some(s) = &self.search {
+            if let Some(&row) = s.matches.get(s.current) {
+                // A few lines of context above the match.
+                self.scroll = row.saturating_sub(3).min(self.scroll_limit());
+            }
         }
     }
 
@@ -156,10 +251,13 @@ impl Stream {
             Style::new().dark_gray()
         };
         // Sticky header: the current file's path lives in the block title.
-        let title = match self.current_file() {
+        let mut title = match self.current_file() {
             Some(fi) => format!(" {}  ({}/{}) ", files[fi].path, fi + 1, files.len()),
             None => String::from(" diff "),
         };
+        if let Some((current, total, query)) = self.search_status() {
+            title.push_str(&format!("─ /{query}  {current}/{total} "));
+        }
         let block = Block::new()
             .borders(Borders::TOP)
             .border_style(border_style)
@@ -182,6 +280,44 @@ impl Stream {
     #[cfg(test)]
     fn set_viewport(&self, height: usize) {
         self.viewport.set(height);
+    }
+
+    /// Split a line's content into spans, painting search matches yellow.
+    fn content_spans(&self, content: &str, base: Style) -> Vec<Span<'static>> {
+        let Some(search) = &self.search else {
+            return vec![Span::styled(content.to_string(), base)];
+        };
+        let needle = if search.case_sensitive {
+            search.query.clone()
+        } else {
+            search.query.to_lowercase()
+        };
+        let hay = if search.case_sensitive {
+            content.to_string()
+        } else {
+            content.to_lowercase()
+        };
+        // Lowercasing can change byte lengths (İ → i̇); offsets into `hay`
+        // would then be invalid in `content`, so skip in-line highlighting.
+        if hay.len() != content.len() {
+            return vec![Span::styled(content.to_string(), base)];
+        }
+        let hit = Style::new().fg(Color::Black).bg(Color::Yellow);
+        let mut spans = Vec::new();
+        let mut pos = 0;
+        while let Some(found) = hay[pos..].find(&needle) {
+            let start = pos + found;
+            let end = start + needle.len();
+            if start > pos {
+                spans.push(Span::styled(content[pos..start].to_string(), base));
+            }
+            spans.push(Span::styled(content[start..end].to_string(), hit));
+            pos = end;
+        }
+        if pos < content.len() {
+            spans.push(Span::styled(content[pos..].to_string(), base));
+        }
+        spans
     }
 
     fn render_row(&self, row: &Row, files: &[FileDiff], width: u16) -> Line<'static> {
@@ -219,13 +355,15 @@ impl Stream {
                     .map(|n| format!("{n:>5}"))
                     .unwrap_or_else(|| " ".repeat(5));
                 let gutter = format!("{old} {new} ");
-                let body = format!("{}{}", line.origin, line.content);
-                let styled_body = match line.origin {
-                    '+' => body.green(),
-                    '-' => body.red(),
-                    _ => body.into(),
+                let base_style = match line.origin {
+                    '+' => Style::new().green(),
+                    '-' => Style::new().red(),
+                    _ => Style::new(),
                 };
-                Line::from(vec![gutter.dark_gray(), styled_body])
+                let mut spans = vec![gutter.dark_gray()];
+                spans.push(Span::styled(line.origin.to_string(), base_style));
+                spans.extend(self.content_spans(&line.content, base_style));
+                Line::from(spans)
             }
         }
     }

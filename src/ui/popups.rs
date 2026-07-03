@@ -8,6 +8,8 @@ const HELP: &[(&str, &str)] = &[
     ("g / G", "jump to top / bottom"),
     ("] / [", "next / previous file"),
     ("n / p", "next / previous hunk"),
+    ("/", "search the diff"),
+    ("n / N", "next / previous match while a search is live"),
     ("Tab", "pick a file from the tree (Esc cancels)"),
     ("⏎", "open the selected file / entry"),
     ("t", "show / hide the file tree"),

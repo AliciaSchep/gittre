@@ -151,11 +151,28 @@ expand" row.
 - **M2 — all scopes.** Scope picker, staged, branch-vs-base with auto base
   detection, commit log picker, `x` to switch. CLI shortcuts. Help popup.
 - **M3 — auto-reload.** Watcher, debounce, background re-diff, scroll
-  preservation.
-- **M4 — polish.** Side-by-side view, syntax highlighting, commit-range scope,
-  whitespace toggle, `/` search within diff, mouse support, theming.
+  preservation. ✅
+- **M4 — polish**, in priority order:
+  1. **`/` search** across the diff stream. Smart-case; matches highlighted;
+     while a search is live `n`/`N` walk matches and `Esc` clears it
+     (restoring `n`/`p` to hunk nav).
+  2. **Mouse**: wheel scrolls the pane under the pointer; click a tree row to
+     jump; click to choose in pickers. (Capture disables native terminal
+     selection — built-in copy below compensates; shift+drag bypasses.)
+  3. **Cursor + selection + copy**: visible line cursor; `v` select, `y`
+     copies clean code (new side, no signs), `Y` copies patch-style with
+     signs; clipboard via `arboard`. The cursor/selection machinery is shared
+     groundwork for M5 commenting.
+  4. **Full-file view**: `o` opens an internal read-only pager at the current
+     line — reads the git blob for historical scopes, disk for worktree
+     scopes; `q`/`Esc` back.
+  5. **Commit ranges**: Space in the log picker marks a base, Enter picks the
+     tip → review `base..tip`; CLI `gittre a..b`.
+  6. **Syntax highlighting** (`syntect`, per-visible-line, cached,
+     independent per-line like delta; add/remove stays as bg tint).
+  7. **Side-by-side view** (`s` toggle, auto-fallback when narrow).
 - **M5 — commenting** (design TBD, see §7). Line/range comments, persistence,
-  markdown export.
+  markdown export. Builds on the M4 cursor/selection.
 
 Each milestone is shippable; M1–M3 is already a useful daily tool.
 

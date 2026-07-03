@@ -68,6 +68,8 @@ pub struct App {
     seq: u64,
     reloading: bool,
     reloaded_at: Option<Instant>,
+    /// In-progress `/` query; Some while the user is typing it.
+    search_input: Option<String>,
 }
 
 const TREE_WIDTH: u16 = 32;
@@ -96,6 +98,7 @@ impl App {
             seq: 0,
             reloading: false,
             reloaded_at: None,
+            search_input: None,
         }
     }
 
@@ -170,7 +173,10 @@ impl App {
             Screen::Review(review) => draw_review(review, frame, main_area),
         }
 
-        bar::render(frame, bar_area, &self.hints());
+        match &self.search_input {
+            Some(query) => bar::render_search_input(frame, bar_area, query),
+            None => bar::render(frame, bar_area, &self.hints()),
+        }
 
         if self.show_help {
             popups::render_help(frame, frame.area());
@@ -209,6 +215,9 @@ impl App {
         if self.show_help {
             return vec![("q/Esc/?", "close help")];
         }
+        if self.search_input.is_some() {
+            return vec![("⏎", "search"), ("Esc", "cancel")];
+        }
         match &self.screen {
             Screen::Picker(picker) => vec![
                 ("1-9", "open"),
@@ -245,15 +254,20 @@ impl App {
                         ("?", "help"),
                     ];
                 }
-                let mut hints: Vec<(&str, &str)> =
-                    vec![("↑↓/jk", "scroll"), ("]/[", "file"), ("n/p", "hunk")];
-                if review.show_tree {
-                    hints.push(("Tab", "pick file"));
-                    hints.push(("t", "hide tree"));
+                let mut hints: Vec<(&str, &str)> = vec![("↑↓/jk", "scroll"), ("]/[", "file")];
+                if review.stream.has_search() {
+                    hints.push(("n/N", "match"));
+                    hints.push(("Esc", "clear search"));
                 } else {
-                    hints.push(("Tab", "pick file"));
-                    hints.push(("t", "show tree"));
+                    hints.push(("n/p", "hunk"));
                 }
+                hints.push(("/", "search"));
+                hints.push(("Tab", "pick file"));
+                hints.push(if review.show_tree {
+                    ("t", "hide tree")
+                } else {
+                    ("t", "show tree")
+                });
                 hints.extend([("x/q", "scope"), ("?", "help")]);
                 hints
             }
@@ -276,6 +290,10 @@ impl App {
             self.quit = true;
             return;
         }
+        if self.search_input.is_some() {
+            self.on_search_input_key(code);
+            return;
+        }
         if code == KeyCode::Char('?') {
             self.show_help = true;
             return;
@@ -286,6 +304,35 @@ impl App {
             Screen::Log(_) => self.on_log_key(code),
             Screen::Base(_) => self.on_base_key(code),
             Screen::Review(_) => self.on_review_key(code, modifiers),
+        }
+    }
+
+    fn on_search_input_key(&mut self, code: KeyCode) {
+        let Some(input) = &mut self.search_input else {
+            return;
+        };
+        match code {
+            KeyCode::Esc => self.search_input = None,
+            KeyCode::Backspace => {
+                input.pop();
+            }
+            KeyCode::Enter => {
+                let query = self.search_input.take().unwrap_or_default();
+                if query.is_empty() {
+                    return;
+                }
+                if let Screen::Review(review) = &mut self.screen {
+                    let count = review.stream.set_search(&query, &review.diff.files);
+                    if count == 0 {
+                        self.error = Some(format!("no matches for \u{2018}{query}\u{2019}"));
+                    } else {
+                        review.focus = Focus::Stream;
+                        sync_tree(review);
+                    }
+                }
+            }
+            KeyCode::Char(c) => input.push(c),
+            _ => {}
         }
     }
 
@@ -401,12 +448,22 @@ impl App {
             return;
         };
         match code {
-            // Esc first backs out of an active tree pick, then leaves the review.
+            // Esc peels back one layer at a time: live search → tree pick → picker.
+            KeyCode::Esc if review.stream.has_search() => review.stream.clear_search(),
             KeyCode::Esc if review.focus == Focus::Tree => {
                 review.focus = Focus::Stream;
                 sync_tree(review);
             }
             KeyCode::Char('q') | KeyCode::Esc | KeyCode::Char('x') => self.open_picker(),
+            KeyCode::Char('/') => self.search_input = Some(String::new()),
+            KeyCode::Char('n') if review.stream.has_search() => {
+                review.stream.next_match();
+                sync_tree(review);
+            }
+            KeyCode::Char('N') if review.stream.has_search() => {
+                review.stream.prev_match();
+                sync_tree(review);
+            }
             KeyCode::Char('t') => {
                 review.show_tree = !review.show_tree;
                 if !review.show_tree {
@@ -590,11 +647,17 @@ fn draw_review(review: &ReviewState, frame: &mut Frame, area: Rect) {
 fn apply_reload(review: &mut ReviewState, diff: DiffResult) {
     let anchor = review.stream.anchor(&review.diff.files);
     let collapsed = review.tree.collapsed_dirs();
+    let query = review.stream.search_query();
 
     review.diff = diff;
     review.stream = Stream::new(&review.diff);
     review.tree = FileTree::new(&review.diff.files);
     review.tree.apply_collapsed(&collapsed);
+    // Re-run a live search against the new content, but let the anchor
+    // (applied below) win over the jump-to-first-match.
+    if let Some(query) = query {
+        review.stream.set_search(&query, &review.diff.files);
+    }
     if let Some(anchor) = &anchor {
         review.stream.restore(anchor, &review.diff.files);
     }
