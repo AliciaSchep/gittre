@@ -1,9 +1,11 @@
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Paragraph};
 
 use crate::git::diff::{DiffResult, FileDiff, FileStatus};
+use crate::ui::highlight::Highlighter;
 
 /// One renderable row of the concatenated diff stream.
 enum Row {
@@ -46,6 +48,9 @@ pub struct Stream {
     viewport: Cell<usize>,
     search: Option<SearchState>,
     selection: Option<Selection>,
+    /// Cached syntax spans per (file, hunk, line); None caches a miss.
+    #[allow(clippy::type_complexity)]
+    syntax_cache: RefCell<HashMap<(usize, usize, usize), Option<Vec<Span<'static>>>>>,
 }
 
 impl Stream {
@@ -81,6 +86,7 @@ impl Stream {
             viewport: Cell::new(24),
             search: None,
             selection: None,
+            syntax_cache: RefCell::new(HashMap::new()),
         }
     }
 
@@ -341,7 +347,14 @@ impl Stream {
         }
     }
 
-    pub fn render(&self, frame: &mut Frame, area: Rect, files: &[FileDiff], focused: bool) {
+    pub fn render(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        files: &[FileDiff],
+        focused: bool,
+        hl: &Highlighter,
+    ) {
         let border_style = if focused {
             Style::new().cyan()
         } else {
@@ -371,7 +384,7 @@ impl Stream {
             .skip(self.scroll)
             .take(inner.height as usize)
             .map(|(idx, row)| {
-                let mut line = self.render_row(row, files, inner.width);
+                let mut line = self.render_row(row, files, inner.width, hl);
                 if let Some(sel) = &self.selection {
                     let (lo, hi) = sel.range();
                     if idx >= lo && idx <= hi {
@@ -390,6 +403,48 @@ impl Stream {
     #[cfg(test)]
     fn set_viewport(&self, height: usize) {
         self.viewport.set(height);
+    }
+
+    fn line_matches_search(&self, content: &str) -> bool {
+        let Some(search) = &self.search else {
+            return false;
+        };
+        if search.case_sensitive {
+            content.contains(&search.query)
+        } else {
+            content
+                .to_lowercase()
+                .contains(&search.query.to_lowercase())
+        }
+    }
+
+    /// Syntax-colored spans for a diff line, with a red/green background
+    /// tint preserving the add/remove signal. Cached per row.
+    fn syntax_spans(
+        &self,
+        hl: &Highlighter,
+        key: (usize, usize, usize),
+        path: &str,
+        line: &crate::git::diff::DiffLine,
+    ) -> Option<Vec<Span<'static>>> {
+        if let Some(cached) = self.syntax_cache.borrow().get(&key) {
+            return cached.clone();
+        }
+        let tint = match line.origin {
+            '+' => Some(Color::Rgb(16, 48, 16)),
+            '-' => Some(Color::Rgb(58, 20, 20)),
+            _ => None,
+        };
+        let spans = hl.line_spans(path, &line.content).map(|sp| {
+            sp.into_iter()
+                .map(|span| match tint {
+                    Some(bg) => span.bg(bg),
+                    None => span,
+                })
+                .collect::<Vec<_>>()
+        });
+        self.syntax_cache.borrow_mut().insert(key, spans.clone());
+        spans
     }
 
     /// Split a line's content into spans, painting search matches yellow.
@@ -430,7 +485,13 @@ impl Stream {
         spans
     }
 
-    fn render_row(&self, row: &Row, files: &[FileDiff], width: u16) -> Line<'static> {
+    fn render_row(
+        &self,
+        row: &Row,
+        files: &[FileDiff],
+        width: u16,
+        hl: &Highlighter,
+    ) -> Line<'static> {
         match *row {
             Row::Spacer => Line::default(),
             Row::FileHeader(fi) => {
@@ -472,7 +533,16 @@ impl Stream {
                 };
                 let mut spans = vec![gutter.dark_gray()];
                 spans.push(Span::styled(line.origin.to_string(), base_style));
-                spans.extend(self.content_spans(&line.content, base_style));
+                // Search hits keep the plain rendering so the yellow overlay
+                // stays visible; everything else gets syntax colors.
+                let searched = self.search.is_some() && self.line_matches_search(&line.content);
+                let syntax = (!searched)
+                    .then(|| self.syntax_spans(hl, (fi, hi, li), &files[fi].path, line))
+                    .flatten();
+                match syntax {
+                    Some(sp) => spans.extend(sp),
+                    None => spans.extend(self.content_spans(&line.content, base_style)),
+                }
                 Line::from(spans)
             }
         }

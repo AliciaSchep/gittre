@@ -15,6 +15,7 @@ use crate::git::diff::{self, DiffResult};
 use crate::git::log::commit_log;
 use crate::git::scope::{Scope, base_candidates, detect_base, file_content, file_count};
 use crate::ui::fileview::FileView;
+use crate::ui::highlight::Highlighter;
 use crate::ui::picker::{BasePicker, LogPicker, ScopeAction, ScopeItem, ScopePicker};
 use crate::ui::review::Stream;
 use crate::ui::tree::FileTree;
@@ -81,6 +82,7 @@ pub struct App {
     /// $EDITOR launch requested by `E`; handled in the run loop where the
     /// terminal handle is available for suspend/resume.
     pending_editor: Option<(std::path::PathBuf, usize)>,
+    highlighter: Highlighter,
 }
 
 const TREE_WIDTH: u16 = 32;
@@ -112,6 +114,7 @@ impl App {
             search_input: None,
             notice: None,
             pending_editor: None,
+            highlighter: Highlighter::new(),
         }
     }
 
@@ -299,7 +302,7 @@ impl App {
             Screen::Picker(picker) => picker.render(frame, main_area),
             Screen::Log(log) => log.render(frame, main_area),
             Screen::Base(base) => base.render(frame, main_area),
-            Screen::Review(review) => draw_review(review, frame, main_area),
+            Screen::Review(review) => draw_review(review, frame, main_area, &self.highlighter),
         }
 
         match &self.search_input {
@@ -777,7 +780,13 @@ impl App {
         match file_content(&self.repo, &review.scope, &path) {
             Ok((content, source)) => {
                 let target = line.map(|l| l.saturating_sub(1) as usize);
-                review.file_view = Some(FileView::new(path, source, &content, target));
+                review.file_view = Some(FileView::new(
+                    path,
+                    source,
+                    &content,
+                    target,
+                    &self.highlighter,
+                ));
             }
             Err(e) => self.error = Some(format!("{e:#}")),
         }
@@ -879,7 +888,7 @@ fn build_picker(repo: &Repository) -> ScopePicker {
     ScopePicker::new(items)
 }
 
-fn draw_review(review: &mut ReviewState, frame: &mut Frame, area: Rect) {
+fn draw_review(review: &mut ReviewState, frame: &mut Frame, area: Rect, hl: &Highlighter) {
     if let Some(view) = &review.file_view {
         view.render(frame, area);
         return;
@@ -913,9 +922,12 @@ fn draw_review(review: &mut ReviewState, frame: &mut Frame, area: Rect) {
             stream_area,
             &review.diff.files,
             review.focus == Focus::Stream,
+            hl,
         );
     } else {
-        review.stream.render(frame, area, &review.diff.files, true);
+        review
+            .stream
+            .render(frame, area, &review.diff.files, true, hl);
     }
 }
 

@@ -3,12 +3,16 @@ use std::cell::Cell;
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Paragraph};
 
+use crate::ui::highlight::Highlighter;
+
 /// Read-only full-file pager, overlaid on the review screen via `o`.
 pub struct FileView {
     pub path: String,
     /// Where the content came from: "working tree", "index", a sha, …
     pub source: String,
     lines: Vec<String>,
+    /// Stateful syntax highlighting, precomputed at open; None = plain.
+    styled: Option<Vec<Vec<Span<'static>>>>,
     pub scroll: usize,
     /// 0-based line the reader came from; kept highlighted.
     target: Option<usize>,
@@ -16,8 +20,15 @@ pub struct FileView {
 }
 
 impl FileView {
-    pub fn new(path: String, source: String, content: &str, target: Option<usize>) -> Self {
+    pub fn new(
+        path: String,
+        source: String,
+        content: &str,
+        target: Option<usize>,
+        hl: &Highlighter,
+    ) -> Self {
         let lines: Vec<String> = content.lines().map(str::to_string).collect();
+        let styled = hl.file_lines(&path, content);
         let scroll = target
             .map(|t| t.saturating_sub(3))
             .unwrap_or(0)
@@ -26,6 +37,7 @@ impl FileView {
             path,
             source,
             lines,
+            styled,
             scroll,
             target,
             viewport: Cell::new(24),
@@ -77,10 +89,12 @@ impl FileView {
             .skip(self.scroll)
             .take(inner.height as usize)
             .map(|(i, text)| {
-                let mut line = Line::from(vec![
-                    format!("{:>width$} ", i + 1).dark_gray(),
-                    Span::raw(text.clone()),
-                ]);
+                let mut spans = vec![format!("{:>width$} ", i + 1).dark_gray()];
+                match self.styled.as_ref().and_then(|s| s.get(i)) {
+                    Some(sp) => spans.extend(sp.iter().cloned()),
+                    None => spans.push(Span::raw(text.clone())),
+                }
+                let mut line = Line::from(spans);
                 if self.target == Some(i) {
                     line = line.on_dark_gray().bold();
                 }
