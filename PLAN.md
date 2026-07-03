@@ -173,7 +173,7 @@ expand" row.
   6. ✅ **Syntax highlighting** (`syntect`, per-visible-line, cached,
      independent per-line like delta; add/remove stays as bg tint).
 
-  7. **Persistent cursor** (planned; do before or alongside M5.2): promote the
+  7. ✅ **Persistent cursor**: promote the
      select-mode cursor to a permanent `cursor` field on `Stream`, rendered
      every frame. `j`/`k`, paging, and `g`/`G` move the cursor vim-style (view
      follows via the existing `move_cursor` clamp/keep-in-view logic); jumps

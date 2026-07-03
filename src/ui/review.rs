@@ -29,18 +29,6 @@ struct SearchState {
     current: usize,
 }
 
-/// A row-range selection made in select mode (`v`).
-struct Selection {
-    anchor: usize,
-    cursor: usize,
-}
-
-impl Selection {
-    fn range(&self) -> (usize, usize) {
-        (self.anchor.min(self.cursor), self.anchor.max(self.cursor))
-    }
-}
-
 /// Everything needed to create a comment: captured at `c` time.
 #[derive(Clone)]
 pub struct CommentTarget {
@@ -60,10 +48,15 @@ pub struct Stream {
     /// Row index of each comment header, in stream order.
     comment_starts: Vec<usize>,
     pub scroll: usize,
+    /// The highlighted row all position-dependent actions operate on.
+    pub cursor: usize,
+    /// Selection anchor (`v`); the selection is anchor..=cursor.
+    selection_anchor: Option<usize>,
     /// Height of the last rendered viewport, for paging and clamping.
     viewport: Cell<usize>,
     search: Option<SearchState>,
-    selection: Option<Selection>,
+    /// Inner rect from the last render, for mouse hit-testing.
+    last_inner: Cell<Rect>,
     /// Cached syntax spans per (file, hunk, line); None caches a miss.
     #[allow(clippy::type_complexity)]
     syntax_cache: RefCell<HashMap<(usize, usize, usize), Option<Vec<Span<'static>>>>>,
@@ -130,24 +123,69 @@ impl Stream {
             hunk_starts,
             comment_starts,
             scroll: 0,
+            cursor: 0,
+            selection_anchor: None,
             viewport: Cell::new(24),
             search: None,
-            selection: None,
+            last_inner: Cell::new(Rect::default()),
             syntax_cache: RefCell::new(HashMap::new()),
         }
+    }
+
+    // ---- cursor ------------------------------------------------------------
+
+    fn clamp_row(&self, row: isize) -> usize {
+        row.clamp(0, self.rows.len().saturating_sub(1) as isize) as usize
+    }
+
+    /// Scroll just enough to keep the cursor on screen.
+    fn ensure_cursor_visible(&mut self) {
+        let viewport = self.viewport.get().max(1);
+        if self.cursor < self.scroll {
+            self.scroll = self.cursor;
+        } else if self.cursor >= self.scroll + viewport {
+            self.scroll = self.cursor + 1 - viewport;
+        }
+    }
+
+    /// Vim-style: j/k move the cursor; the view follows.
+    pub fn move_cursor(&mut self, delta: isize) {
+        self.cursor = self.clamp_row(self.cursor as isize + delta);
+        self.ensure_cursor_visible();
+    }
+
+    /// Put a jump target at the top of the viewport with the cursor on it.
+    fn jump_to(&mut self, row: usize) {
+        self.cursor = self.clamp_row(row as isize);
+        self.scroll = self.cursor.min(self.scroll_limit());
+    }
+
+    /// Mouse: map a screen position to a stream row.
+    pub fn hit(&self, column: u16, row: u16) -> Option<usize> {
+        let inner = self.last_inner.get();
+        if !inner.contains(Position::new(column, row)) {
+            return None;
+        }
+        let idx = self.scroll + (row - inner.y) as usize;
+        (idx < self.rows.len()).then_some(idx)
+    }
+
+    pub fn set_cursor(&mut self, row: usize) {
+        self.cursor = self.clamp_row(row as isize);
+        self.ensure_cursor_visible();
     }
 
     // ---- comments ----------------------------------------------------------
 
     pub fn next_comment(&mut self) {
-        if let Some(&start) = self.comment_starts.iter().find(|&&s| s > self.scroll) {
-            self.scroll = start.min(self.scroll_limit());
+        if let Some(&start) = self.comment_starts.iter().find(|&&s| s > self.cursor) {
+            self.jump_to(start);
         }
     }
 
     pub fn prev_comment(&mut self) {
-        if let Some(&start) = self.comment_starts.iter().rev().find(|&&s| s < self.scroll) {
-            self.scroll = start;
+        if let Some(&start) = self.comment_starts.iter().rev().find(|&&s| s < self.cursor) {
+            self.jump_to(start);
         }
     }
 
@@ -155,9 +193,9 @@ impl Stream {
         !self.comment_starts.is_empty()
     }
 
-    /// The comment whose block is at the top of the viewport, if any.
-    pub fn comment_at_top(&self) -> Option<usize> {
-        match self.rows.get(self.scroll) {
+    /// The comment whose block the cursor is on, if any.
+    pub fn comment_at_cursor(&self) -> Option<usize> {
+        match self.rows.get(self.cursor) {
             Some(Row::CommentHeader(ci)) | Some(Row::CommentBody(ci, _)) => Some(*ci),
             _ => None,
         }
@@ -165,7 +203,7 @@ impl Stream {
 
     /// Build a comment target from the active selection (single file only).
     pub fn selection_target(&self, files: &[FileDiff]) -> Option<CommentTarget> {
-        let (lo, hi) = self.selection.as_ref()?.range();
+        let (lo, hi) = self.selection_range()?;
         let mut target_file: Option<usize> = None;
         let mut new_nums: Vec<u32> = Vec::new();
         let mut old_nums: Vec<u32> = Vec::new();
@@ -200,9 +238,9 @@ impl Stream {
         })
     }
 
-    /// Target for a bare `c`: the first diff line at/below the viewport top.
+    /// Target for a bare `c`: the first diff line at/below the cursor.
     pub fn line_target(&self, files: &[FileDiff]) -> Option<CommentTarget> {
-        self.rows.iter().skip(self.scroll).find_map(|row| {
+        self.rows.iter().skip(self.cursor).find_map(|row| {
             let Row::Line(fi, hi, li) = *row else {
                 return None;
             };
@@ -223,47 +261,30 @@ impl Stream {
 
     // ---- selection ---------------------------------------------------------
 
-    /// Enter select mode with the cursor on the top visible row.
+    /// `v`: anchor a selection at the cursor; it extends as the cursor moves.
     pub fn start_selection(&mut self) {
-        if self.rows.is_empty() {
-            return;
+        if !self.rows.is_empty() {
+            self.selection_anchor = Some(self.cursor);
         }
-        let start = self.scroll.min(self.rows.len() - 1);
-        self.selection = Some(Selection {
-            anchor: start,
-            cursor: start,
-        });
     }
 
     pub fn cancel_selection(&mut self) {
-        self.selection = None;
+        self.selection_anchor = None;
     }
 
     pub fn has_selection(&self) -> bool {
-        self.selection.is_some()
+        self.selection_anchor.is_some()
     }
 
-    /// Move the selection cursor and keep it in view.
-    pub fn move_cursor(&mut self, delta: isize) {
-        let len = self.rows.len();
-        let Some(sel) = &mut self.selection else {
-            return;
-        };
-        let cursor =
-            (sel.cursor as isize + delta).clamp(0, len.saturating_sub(1) as isize) as usize;
-        sel.cursor = cursor;
-        let viewport = self.viewport.get().max(1);
-        if cursor < self.scroll {
-            self.scroll = cursor;
-        } else if cursor >= self.scroll + viewport {
-            self.scroll = cursor + 1 - viewport;
-        }
+    fn selection_range(&self) -> Option<(usize, usize)> {
+        let anchor = self.selection_anchor?;
+        Some((anchor.min(self.cursor), anchor.max(self.cursor)))
     }
 
     /// Text of the selection. `patch_style` keeps +/- signs and hunk headers;
     /// otherwise returns clean new-side code (deletions skipped).
     pub fn selected_text(&self, files: &[FileDiff], patch_style: bool) -> Option<String> {
-        let (lo, hi) = self.selection.as_ref()?.range();
+        let (lo, hi) = self.selection_range()?;
         let mut out = String::new();
         for row in &self.rows[lo..=hi.min(self.rows.len() - 1)] {
             match *row {
@@ -367,6 +388,7 @@ impl Stream {
     fn jump_to_current_match(&mut self) {
         if let Some(s) = &self.search {
             if let Some(&row) = s.matches.get(s.current) {
+                self.cursor = row.min(self.rows.len().saturating_sub(1));
                 // A few lines of context above the match.
                 self.scroll = row.saturating_sub(3).min(self.scroll_limit());
             }
@@ -379,42 +401,51 @@ impl Stream {
         self.rows.len().saturating_sub(1)
     }
 
+    /// Wheel scroll: moves the view, dragging the cursor along if it would
+    /// leave the window.
     pub fn scroll_by(&mut self, delta: isize) {
         let new = self.scroll as isize + delta;
         self.scroll = new.clamp(0, self.scroll_limit() as isize) as usize;
+        let viewport = self.viewport.get().max(1);
+        let last_visible = (self.scroll + viewport - 1).min(self.rows.len().saturating_sub(1));
+        self.cursor = self.cursor.clamp(self.scroll, last_visible);
     }
 
     pub fn page(&mut self, direction: isize) {
-        self.scroll_by(direction * self.viewport.get().saturating_sub(1) as isize);
+        self.move_cursor(direction * self.viewport.get().saturating_sub(1) as isize);
     }
 
     pub fn scroll_to_top(&mut self) {
+        self.cursor = 0;
         self.scroll = 0;
     }
 
-    /// Show the full last page rather than a lone final row.
+    /// Cursor to the last row; show the full last page.
     pub fn scroll_to_bottom(&mut self) {
+        self.cursor = self.rows.len().saturating_sub(1);
         self.scroll = self.rows.len().saturating_sub(self.viewport.get());
     }
 
     pub fn jump_to_file(&mut self, file_idx: usize) {
         if let Some(&start) = self.file_starts.get(file_idx) {
-            self.scroll = start;
+            self.jump_to(start);
         }
     }
 
-    /// Where the reader is, expressed as (file path, rows below its header) —
-    /// stable across reloads even when other files grow or shrink.
-    pub fn anchor(&self, files: &[FileDiff]) -> Option<(String, usize)> {
+    /// Where the reader is: (file path, cursor rows below its header, cursor
+    /// rows below the viewport top) — stable across reloads even when other
+    /// files grow or shrink.
+    pub fn anchor(&self, files: &[FileDiff]) -> Option<(String, usize, usize)> {
         let fi = self.current_file()?;
-        let rel = self.scroll - self.file_starts[fi];
-        Some((files[fi].path.clone(), rel))
+        let rel = self.cursor - self.file_starts[fi];
+        let screen_offset = self.cursor.saturating_sub(self.scroll);
+        Some((files[fi].path.clone(), rel, screen_offset))
     }
 
     /// Re-apply an anchor after the diff was rebuilt. Falls back to clamping
     /// when the anchored file disappeared from the new diff.
-    pub fn restore(&mut self, anchor: &(String, usize), files: &[FileDiff]) {
-        let (path, rel) = anchor;
+    pub fn restore(&mut self, anchor: &(String, usize, usize), files: &[FileDiff]) {
+        let (path, rel, screen_offset) = anchor;
         if let Some(fi) = files.iter().position(|f| &f.path == path) {
             let start = self.file_starts[fi];
             let end = self
@@ -422,9 +453,14 @@ impl Stream {
                 .get(fi + 1)
                 .copied()
                 .unwrap_or(self.rows.len());
-            self.scroll = (start + rel).min(end.saturating_sub(1));
+            self.cursor = (start + rel).min(end.saturating_sub(1));
         }
-        self.scroll = self.scroll.min(self.scroll_limit());
+        self.cursor = self.clamp_row(self.cursor as isize);
+        self.scroll = self
+            .cursor
+            .saturating_sub(*screen_offset)
+            .min(self.scroll_limit());
+        self.ensure_cursor_visible();
     }
 
     /// The first content row at or below the top of the viewport:
@@ -443,38 +479,38 @@ impl Stream {
             })
     }
 
-    /// Index of the file whose content is at the top of the viewport.
+    /// Index of the file the cursor is in.
     pub fn current_file(&self) -> Option<usize> {
         if self.file_starts.is_empty() {
             return None;
         }
         let pos = self
             .file_starts
-            .partition_point(|&start| start <= self.scroll);
+            .partition_point(|&start| start <= self.cursor);
         Some(pos.saturating_sub(1))
     }
 
     pub fn next_file(&mut self) {
-        if let Some(&start) = self.file_starts.iter().find(|&&s| s > self.scroll) {
-            self.scroll = start;
+        if let Some(&start) = self.file_starts.iter().find(|&&s| s > self.cursor) {
+            self.jump_to(start);
         }
     }
 
     pub fn prev_file(&mut self) {
-        if let Some(&start) = self.file_starts.iter().rev().find(|&&s| s < self.scroll) {
-            self.scroll = start;
+        if let Some(&start) = self.file_starts.iter().rev().find(|&&s| s < self.cursor) {
+            self.jump_to(start);
         }
     }
 
     pub fn next_hunk(&mut self) {
-        if let Some(&start) = self.hunk_starts.iter().find(|&&s| s > self.scroll) {
-            self.scroll = start;
+        if let Some(&start) = self.hunk_starts.iter().find(|&&s| s > self.cursor) {
+            self.jump_to(start);
         }
     }
 
     pub fn prev_hunk(&mut self) {
-        if let Some(&start) = self.hunk_starts.iter().rev().find(|&&s| s < self.scroll) {
-            self.scroll = start;
+        if let Some(&start) = self.hunk_starts.iter().rev().find(|&&s| s < self.cursor) {
+            self.jump_to(start);
         }
     }
 
@@ -508,6 +544,7 @@ impl Stream {
         frame.render_widget(block, area);
 
         self.viewport.set(inner.height as usize);
+        self.last_inner.set(inner);
 
         let visible = self
             .rows
@@ -517,14 +554,13 @@ impl Stream {
             .take(inner.height as usize)
             .map(|(idx, row)| {
                 let mut line = self.render_row(row, files, comments, inner.width, hl);
-                if let Some(sel) = &self.selection {
-                    let (lo, hi) = sel.range();
+                if let Some((lo, hi)) = self.selection_range() {
                     if idx >= lo && idx <= hi {
                         line = line.on_dark_gray();
                     }
-                    if idx == sel.cursor {
-                        line = line.bold().underlined();
-                    }
+                }
+                if idx == self.cursor && focused {
+                    line = line.bold().underlined();
                 }
                 line
             })

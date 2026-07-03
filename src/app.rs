@@ -239,6 +239,10 @@ impl App {
                         review.stream.jump_to_file(file_idx);
                         review.focus = Focus::Stream;
                     }
+                } else if let Some(idx) = review.stream.hit(col, row) {
+                    review.stream.set_cursor(idx);
+                    review.focus = Focus::Stream;
+                    sync_tree(review);
                 }
             }
             // The scope picker is a menu: click opens directly.
@@ -782,31 +786,24 @@ impl App {
             }
             return;
         }
-        if review.stream.has_selection() {
-            match code {
-                KeyCode::Esc | KeyCode::Char('v') => review.stream.cancel_selection(),
-                KeyCode::Char('j') | KeyCode::Down => review.stream.move_cursor(1),
-                KeyCode::Char('k') | KeyCode::Up => review.stream.move_cursor(-1),
-                KeyCode::PageDown => review.stream.move_cursor(20),
-                KeyCode::PageUp => review.stream.move_cursor(-20),
-                KeyCode::Char('y') => self.copy_selection(false),
-                KeyCode::Char('Y') => self.copy_selection(true),
-                KeyCode::Char('c') => {
-                    if let Some(t) = review.stream.selection_target(&review.diff.files) {
-                        review.stream.cancel_selection();
-                        self.comment_draft = Some(CommentDraft {
-                            body: String::new(),
-                            editing: None,
-                            label: target_label(&t),
-                            target: Some(t),
-                        });
-                    }
-                }
-                _ => {}
-            }
-            return;
-        }
         match code {
+            // Selection-mode actions; all navigation keys fall through and
+            // extend the selection by moving the shared cursor.
+            KeyCode::Esc if review.stream.has_selection() => review.stream.cancel_selection(),
+            KeyCode::Char('v') if review.stream.has_selection() => review.stream.cancel_selection(),
+            KeyCode::Char('y') if review.stream.has_selection() => self.copy_selection(false),
+            KeyCode::Char('Y') if review.stream.has_selection() => self.copy_selection(true),
+            KeyCode::Char('c') if review.stream.has_selection() => {
+                if let Some(t) = review.stream.selection_target(&review.diff.files) {
+                    review.stream.cancel_selection();
+                    self.comment_draft = Some(CommentDraft {
+                        body: String::new(),
+                        editing: None,
+                        label: target_label(&t),
+                        target: Some(t),
+                    });
+                }
+            }
             // Esc peels back one layer at a time: live search → tree pick → picker.
             KeyCode::Esc if review.stream.has_search() => review.stream.clear_search(),
             KeyCode::Esc if review.focus == Focus::Tree => {
@@ -820,7 +817,7 @@ impl App {
             }
             KeyCode::Char('o') => self.open_file_view(),
             KeyCode::Char('c') => {
-                if let Some(ci) = review.stream.comment_at_top() {
+                if let Some(ci) = review.stream.comment_at_cursor() {
                     let c = &self.store.comments[ci];
                     self.comment_draft = Some(CommentDraft {
                         body: c.body.clone(),
@@ -838,7 +835,7 @@ impl App {
                 }
             }
             KeyCode::Char('d') if !modifiers.contains(KeyModifiers::CONTROL) => {
-                if let Some(ci) = review.stream.comment_at_top() {
+                if let Some(ci) = review.stream.comment_at_cursor() {
                     let id = self.store.comments[ci].id;
                     if let Err(e) = self.store.delete(id) {
                         self.error = Some(format!("{e:#}"));
@@ -900,24 +897,32 @@ impl App {
             KeyCode::Char('j') | KeyCode::Down => match review.focus {
                 Focus::Tree => review.tree.move_selection(1),
                 Focus::Stream => {
-                    review.stream.scroll_by(1);
+                    review.stream.move_cursor(1);
                     sync_tree(review);
                 }
             },
             KeyCode::Char('k') | KeyCode::Up => match review.focus {
                 Focus::Tree => review.tree.move_selection(-1),
                 Focus::Stream => {
-                    review.stream.scroll_by(-1);
+                    review.stream.move_cursor(-1);
                     sync_tree(review);
                 }
             },
-            KeyCode::PageDown => review.stream.page(1),
-            KeyCode::PageUp => review.stream.page(-1),
+            KeyCode::PageDown => {
+                review.stream.page(1);
+                sync_tree(review);
+            }
+            KeyCode::PageUp => {
+                review.stream.page(-1);
+                sync_tree(review);
+            }
             KeyCode::Char('d') if modifiers.contains(KeyModifiers::CONTROL) => {
-                review.stream.page(1)
+                review.stream.page(1);
+                sync_tree(review);
             }
             KeyCode::Char('u') if modifiers.contains(KeyModifiers::CONTROL) => {
-                review.stream.page(-1)
+                review.stream.page(-1);
+                sync_tree(review);
             }
             KeyCode::Char('g') | KeyCode::Home => {
                 review.stream.scroll_to_top();
