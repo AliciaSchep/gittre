@@ -11,6 +11,8 @@ struct Node {
     /// Index into the diff's file list; None for directories.
     file: Option<usize>,
     status: Option<FileStatus>,
+    /// Comments on this file (badge).
+    comments: usize,
     children: Vec<Node>,
     expanded: bool,
 }
@@ -32,11 +34,12 @@ struct VisibleRow<'a> {
 }
 
 impl FileTree {
-    pub fn new(files: &[FileDiff]) -> Self {
+    pub fn new(files: &[FileDiff], comment_counts: &[usize]) -> Self {
         let mut root = Node {
             name: String::new(),
             file: None,
             status: None,
+            comments: 0,
             children: Vec::new(),
             expanded: true,
         };
@@ -56,6 +59,11 @@ impl FileTree {
                             name: part.to_string(),
                             file: is_leaf.then_some(idx),
                             status: is_leaf.then_some(file.status),
+                            comments: if is_leaf {
+                                comment_counts.get(idx).copied().unwrap_or(0)
+                            } else {
+                                0
+                            },
                             children: Vec::new(),
                             expanded: true,
                         });
@@ -229,6 +237,9 @@ impl FileTree {
                     };
                     spans.push(status_span);
                     spans.push(Span::raw(row.node.name.clone()));
+                    if row.node.comments > 0 {
+                        spans.push(format!(" ✎ {}", row.node.comments).cyan());
+                    }
                 }
                 ListItem::new(Line::from(spans))
             })

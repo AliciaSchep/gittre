@@ -1,4 +1,5 @@
 mod app;
+mod comments;
 mod event;
 mod git;
 mod ui;

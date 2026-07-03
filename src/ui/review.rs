@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Paragraph};
 
+use crate::comments::{Anchor, Comment, Placed};
 use crate::git::diff::{DiffResult, FileDiff, FileStatus};
 use crate::ui::highlight::Highlighter;
 
@@ -14,6 +15,10 @@ enum Row {
     Binary,
     HunkHeader(usize, usize),
     Line(usize, usize, usize),
+    /// Comment block header; the index is into the comment store slice.
+    CommentHeader(usize),
+    /// One body line of a comment: (comment index, body line index).
+    CommentBody(usize, usize),
 }
 
 struct SearchState {
@@ -36,6 +41,15 @@ impl Selection {
     }
 }
 
+/// Everything needed to create a comment: captured at `c` time.
+#[derive(Clone)]
+pub struct CommentTarget {
+    pub path: String,
+    pub new_side: bool,
+    pub lines: (u32, u32),
+    pub snippet: Vec<String>,
+}
+
 /// The continuous multi-file diff view.
 pub struct Stream {
     rows: Vec<Row>,
@@ -43,6 +57,8 @@ pub struct Stream {
     file_starts: Vec<usize>,
     /// Row index of each hunk header, in stream order.
     hunk_starts: Vec<usize>,
+    /// Row index of each comment header, in stream order.
+    comment_starts: Vec<usize>,
     pub scroll: usize,
     /// Height of the last rendered viewport, for paging and clamping.
     viewport: Cell<usize>,
@@ -54,10 +70,30 @@ pub struct Stream {
 }
 
 impl Stream {
-    pub fn new(diff: &DiffResult) -> Self {
+    pub fn new(diff: &DiffResult, placed: &[Placed], comments: &[Comment]) -> Self {
+        let mut at_line: HashMap<(usize, usize, usize), Vec<usize>> = HashMap::new();
+        let mut at_top: HashMap<usize, Vec<usize>> = HashMap::new();
+        for p in placed {
+            match p.anchor {
+                Anchor::Line { hunk, line } => at_line
+                    .entry((p.file, hunk, line))
+                    .or_default()
+                    .push(p.comment),
+                Anchor::FileTop => at_top.entry(p.file).or_default().push(p.comment),
+            }
+        }
+
         let mut rows = Vec::new();
         let mut file_starts = Vec::new();
         let mut hunk_starts = Vec::new();
+        let mut comment_starts = Vec::new();
+        let push_comment = |rows: &mut Vec<Row>, starts: &mut Vec<usize>, ci: usize| {
+            starts.push(rows.len());
+            rows.push(Row::CommentHeader(ci));
+            for bi in 0..comments[ci].body.lines().count().max(1) {
+                rows.push(Row::CommentBody(ci, bi));
+            }
+        };
 
         for (fi, file) in diff.files.iter().enumerate() {
             if fi > 0 {
@@ -65,6 +101,11 @@ impl Stream {
             }
             file_starts.push(rows.len());
             rows.push(Row::FileHeader(fi));
+            if let Some(cs) = at_top.get(&fi) {
+                for &ci in cs {
+                    push_comment(&mut rows, &mut comment_starts, ci);
+                }
+            }
             if file.binary {
                 rows.push(Row::Binary);
                 continue;
@@ -74,6 +115,11 @@ impl Stream {
                 rows.push(Row::HunkHeader(fi, hi));
                 for li in 0..hunk.lines.len() {
                     rows.push(Row::Line(fi, hi, li));
+                    if let Some(cs) = at_line.get(&(fi, hi, li)) {
+                        for &ci in cs {
+                            push_comment(&mut rows, &mut comment_starts, ci);
+                        }
+                    }
                 }
             }
         }
@@ -82,12 +128,97 @@ impl Stream {
             rows,
             file_starts,
             hunk_starts,
+            comment_starts,
             scroll: 0,
             viewport: Cell::new(24),
             search: None,
             selection: None,
             syntax_cache: RefCell::new(HashMap::new()),
         }
+    }
+
+    // ---- comments ----------------------------------------------------------
+
+    pub fn next_comment(&mut self) {
+        if let Some(&start) = self.comment_starts.iter().find(|&&s| s > self.scroll) {
+            self.scroll = start.min(self.scroll_limit());
+        }
+    }
+
+    pub fn prev_comment(&mut self) {
+        if let Some(&start) = self.comment_starts.iter().rev().find(|&&s| s < self.scroll) {
+            self.scroll = start;
+        }
+    }
+
+    pub fn has_comments(&self) -> bool {
+        !self.comment_starts.is_empty()
+    }
+
+    /// The comment whose block is at the top of the viewport, if any.
+    pub fn comment_at_top(&self) -> Option<usize> {
+        match self.rows.get(self.scroll) {
+            Some(Row::CommentHeader(ci)) | Some(Row::CommentBody(ci, _)) => Some(*ci),
+            _ => None,
+        }
+    }
+
+    /// Build a comment target from the active selection (single file only).
+    pub fn selection_target(&self, files: &[FileDiff]) -> Option<CommentTarget> {
+        let (lo, hi) = self.selection.as_ref()?.range();
+        let mut target_file: Option<usize> = None;
+        let mut new_nums: Vec<u32> = Vec::new();
+        let mut old_nums: Vec<u32> = Vec::new();
+        let mut snippet = Vec::new();
+        for row in &self.rows[lo..=hi.min(self.rows.len() - 1)] {
+            if let Row::Line(fi, hi_, li) = *row {
+                if *target_file.get_or_insert(fi) != fi {
+                    break; // clamp a cross-file selection to the first file
+                }
+                let line = &files[fi].hunks[hi_].lines[li];
+                if let Some(n) = line.new_lineno {
+                    new_nums.push(n);
+                }
+                if let Some(n) = line.old_lineno {
+                    old_nums.push(n);
+                }
+                snippet.push(format!("{}{}", line.origin, line.content));
+            }
+        }
+        let fi = target_file?;
+        let (new_side, nums) = if new_nums.is_empty() {
+            (false, old_nums)
+        } else {
+            (true, new_nums)
+        };
+        let (&first, &last) = (nums.first()?, nums.last()?);
+        Some(CommentTarget {
+            path: files[fi].path.clone(),
+            new_side,
+            lines: (first, last),
+            snippet,
+        })
+    }
+
+    /// Target for a bare `c`: the first diff line at/below the viewport top.
+    pub fn line_target(&self, files: &[FileDiff]) -> Option<CommentTarget> {
+        self.rows.iter().skip(self.scroll).find_map(|row| {
+            let Row::Line(fi, hi, li) = *row else {
+                return None;
+            };
+            let line = &files[fi].hunks[hi].lines[li];
+            let (new_side, n) = match (line.new_lineno, line.old_lineno) {
+                (Some(n), _) => (true, n),
+                (None, Some(n)) => (false, n),
+                _ => return None,
+            };
+            Some(CommentTarget {
+                path: files[fi].path.clone(),
+                new_side,
+                lines: (n, n),
+                snippet: vec![format!("{}{}", line.origin, line.content)],
+            })
+        })
     }
 
     // ---- selection ---------------------------------------------------------
@@ -352,6 +483,7 @@ impl Stream {
         frame: &mut Frame,
         area: Rect,
         files: &[FileDiff],
+        comments: &[Comment],
         focused: bool,
         hl: &Highlighter,
     ) {
@@ -384,7 +516,7 @@ impl Stream {
             .skip(self.scroll)
             .take(inner.height as usize)
             .map(|(idx, row)| {
-                let mut line = self.render_row(row, files, inner.width, hl);
+                let mut line = self.render_row(row, files, comments, inner.width, hl);
                 if let Some(sel) = &self.selection {
                     let (lo, hi) = sel.range();
                     if idx >= lo && idx <= hi {
@@ -489,6 +621,7 @@ impl Stream {
         &self,
         row: &Row,
         files: &[FileDiff],
+        comments: &[Comment],
         width: u16,
         hl: &Highlighter,
     ) -> Line<'static> {
@@ -514,6 +647,23 @@ impl Stream {
                 Line::from(spans).on_dark_gray()
             }
             Row::Binary => Line::from("   (binary file changed)".dark_gray().italic()),
+            Row::CommentHeader(ci) => {
+                let c = &comments[ci];
+                let range = if c.lines.0 == c.lines.1 {
+                    format!("L{}", c.lines.0)
+                } else {
+                    format!("L{}-L{}", c.lines.0, c.lines.1)
+                };
+                let side = if c.new_side { "" } else { " (old side)" };
+                Line::from(vec![
+                    "▐ ".cyan(),
+                    format!("✎ #{} · {}{}", c.id, range, side).bold().cyan(),
+                ])
+            }
+            Row::CommentBody(ci, bi) => {
+                let body = comments[ci].body.lines().nth(bi).unwrap_or("");
+                Line::from(vec!["▐ ".cyan(), Span::raw(body.to_string())])
+            }
             Row::HunkHeader(fi, hi) => Line::from(files[fi].hunks[hi].header.clone().cyan()),
             Row::Line(fi, hi, li) => {
                 let line = &files[fi].hunks[hi].lines[li];
@@ -587,7 +737,7 @@ mod tests {
     #[test]
     fn anchor_survives_growth_of_earlier_files() {
         let before = diff(&[("a.txt", 3), ("b.txt", 5)]);
-        let mut stream = Stream::new(&before);
+        let mut stream = Stream::new(&before, &[], &[]);
         stream.set_viewport(4);
         stream.jump_to_file(1);
         stream.scroll_by(2); // two rows into b.txt
@@ -596,7 +746,7 @@ mod tests {
 
         // a.txt grows by 10 lines; b.txt's rows all shift down.
         let after = diff(&[("a.txt", 13), ("b.txt", 5)]);
-        let mut stream = Stream::new(&after);
+        let mut stream = Stream::new(&after, &[], &[]);
         stream.set_viewport(4);
         stream.restore(&anchor, &after.files);
         assert_eq!(stream.current_file(), Some(1), "still reading b.txt");
@@ -605,13 +755,13 @@ mod tests {
     #[test]
     fn anchor_of_vanished_file_clamps_safely() {
         let before = diff(&[("a.txt", 3), ("b.txt", 40)]);
-        let mut stream = Stream::new(&before);
+        let mut stream = Stream::new(&before, &[], &[]);
         stream.set_viewport(4);
         stream.scroll_to_bottom();
         let anchor = stream.anchor(&before.files).unwrap();
 
         let after = diff(&[("a.txt", 3)]);
-        let mut stream = Stream::new(&after);
+        let mut stream = Stream::new(&after, &[], &[]);
         stream.set_viewport(4);
         stream.restore(&anchor, &after.files);
         assert!(stream.scroll < 6, "scroll clamped into the smaller diff");

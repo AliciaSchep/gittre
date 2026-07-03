@@ -10,6 +10,7 @@ use ratatui::crossterm::event::{
 use ratatui::prelude::*;
 use ratatui::widgets::Paragraph;
 
+use crate::comments::{CommentStore, place};
 use crate::event::{AppEvent, LoadRequest, spawn_loader};
 use crate::git::diff::{self, DiffResult};
 use crate::git::log::commit_log;
@@ -17,7 +18,7 @@ use crate::git::scope::{Scope, base_candidates, detect_base, file_content, file_
 use crate::ui::fileview::FileView;
 use crate::ui::highlight::Highlighter;
 use crate::ui::picker::{BasePicker, LogPicker, ScopeAction, ScopeItem, ScopePicker};
-use crate::ui::review::Stream;
+use crate::ui::review::{CommentTarget, Stream};
 use crate::ui::tree::FileTree;
 use crate::ui::{bar, popups};
 use crate::watch::{self, RepoWatcher};
@@ -40,9 +41,10 @@ struct ReviewState {
 }
 
 impl ReviewState {
-    fn new(scope: Scope, diff: DiffResult) -> Self {
-        let stream = Stream::new(&diff);
-        let tree = FileTree::new(&diff.files);
+    fn new(scope: Scope, diff: DiffResult, store: &CommentStore) -> Self {
+        let placed = place(&diff, &store.comments);
+        let stream = Stream::new(&diff, &placed, &store.comments);
+        let tree = FileTree::new(&diff.files, &comment_counts(&diff, store));
         ReviewState {
             scope,
             diff,
@@ -83,6 +85,20 @@ pub struct App {
     /// terminal handle is available for suspend/resume.
     pending_editor: Option<(std::path::PathBuf, usize)>,
     highlighter: Highlighter,
+    store: CommentStore,
+    /// Comment being typed; Some while the editor popup is open.
+    comment_draft: Option<CommentDraft>,
+    /// `D` pressed: waiting for y/n to delete every comment.
+    confirm_clear: bool,
+}
+
+struct CommentDraft {
+    body: String,
+    /// Some(id) when editing an existing comment.
+    editing: Option<u64>,
+    /// None when editing (anchor is kept from the original).
+    target: Option<CommentTarget>,
+    label: String,
 }
 
 const TREE_WIDTH: u16 = 32;
@@ -91,8 +107,9 @@ impl App {
     /// `initial`: a scope pre-resolved from CLI flags, already loaded so
     /// errors surface before the terminal is put into raw mode.
     pub fn new(repo: Repository, initial: Option<(Scope, DiffResult)>) -> Self {
+        let store = CommentStore::load(&repo);
         let screen = match initial {
-            Some((scope, diff)) => Screen::Review(Box::new(ReviewState::new(scope, diff))),
+            Some((scope, diff)) => Screen::Review(Box::new(ReviewState::new(scope, diff, &store))),
             None => Screen::Picker(build_picker(&repo)),
         };
         let (event_tx, events) = channel();
@@ -115,6 +132,9 @@ impl App {
             notice: None,
             pending_editor: None,
             highlighter: Highlighter::new(),
+            store,
+            comment_draft: None,
+            confirm_clear: false,
         }
     }
 
@@ -276,7 +296,7 @@ impl App {
                 if let Screen::Review(review) = &mut self.screen {
                     match diff {
                         Ok(diff) => {
-                            apply_reload(review, diff);
+                            apply_reload(review, diff, &self.store);
                             self.reloaded_at = Some(Instant::now());
                         }
                         Err(e) => self.error = Some(format!("{e:#}")),
@@ -302,7 +322,13 @@ impl App {
             Screen::Picker(picker) => picker.render(frame, main_area),
             Screen::Log(log) => log.render(frame, main_area),
             Screen::Base(base) => base.render(frame, main_area),
-            Screen::Review(review) => draw_review(review, frame, main_area, &self.highlighter),
+            Screen::Review(review) => draw_review(
+                review,
+                frame,
+                main_area,
+                &self.highlighter,
+                &self.store.comments,
+            ),
         }
 
         match &self.search_input {
@@ -310,6 +336,18 @@ impl App {
             None => bar::render(frame, bar_area, &self.hints()),
         }
 
+        if let Some(draft) = &self.comment_draft {
+            popups::render_comment_editor(frame, frame.area(), &draft.label, &draft.body);
+        }
+        if self.confirm_clear {
+            let n = self.store.comments.len();
+            let msg = if n == 1 {
+                "delete the 1 comment? [y/n]".to_string()
+            } else {
+                format!("delete all {n} comments? [y/n]")
+            };
+            popups::render_confirm(frame, frame.area(), &msg);
+        }
         if self.show_help {
             popups::render_help(frame, frame.area());
         }
@@ -331,6 +369,9 @@ impl App {
                     spans.push(format!("  {} ", count_label(r.diff.files.len())).into());
                     spans.push(format!("+{} ", r.diff.additions).green());
                     spans.push(format!("−{}", r.diff.deletions).red());
+                    if !self.store.comments.is_empty() {
+                        spans.push(format!("  ✎ {}", self.store.comments.len()).cyan());
+                    }
                     if self.reloading {
                         spans.push("  ↻ reloading…".dark_gray());
                     } else if self
@@ -348,6 +389,12 @@ impl App {
     fn hints(&self) -> Vec<(&'static str, &'static str)> {
         if self.show_help {
             return vec![("q/Esc/?", "close help")];
+        }
+        if self.comment_draft.is_some() {
+            return vec![("⏎", "save"), ("Alt+⏎", "newline"), ("Esc", "cancel")];
+        }
+        if self.confirm_clear {
+            return vec![("y", "delete all comments"), ("any key", "cancel")];
         }
         if self.search_input.is_some() {
             return vec![("⏎", "search"), ("Esc", "cancel")];
@@ -402,6 +449,7 @@ impl App {
                 if review.stream.has_selection() {
                     return vec![
                         ("↑↓/jk", "extend"),
+                        ("c", "comment"),
                         ("y", "copy code"),
                         ("Y", "copy patch"),
                         ("Esc/v", "cancel"),
@@ -424,6 +472,10 @@ impl App {
                     hints.push(("n/p", "hunk"));
                 }
                 hints.push(("/", "search"));
+                hints.push(("c", "comment"));
+                if review.stream.has_comments() {
+                    hints.push(("}/{", "comment nav"));
+                }
                 hints.push(("Tab", "pick file"));
                 hints.push(if review.show_tree {
                     ("t", "hide tree")
@@ -453,6 +505,25 @@ impl App {
             self.quit = true;
             return;
         }
+        if self.comment_draft.is_some() {
+            self.on_draft_key(code, modifiers);
+            return;
+        }
+        if self.confirm_clear {
+            match code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    self.confirm_clear = false;
+                    if let Err(e) = self.store.delete_all() {
+                        self.error = Some(format!("{e:#}"));
+                    } else {
+                        self.notice = Some("all comments deleted".into());
+                    }
+                    self.rebuild_review();
+                }
+                _ => self.confirm_clear = false,
+            }
+            return;
+        }
         if self.search_input.is_some() {
             self.on_search_input_key(code);
             return;
@@ -468,6 +539,72 @@ impl App {
             Screen::Base(_) => self.on_base_key(code),
             Screen::Review(_) => self.on_review_key(code, modifiers),
         }
+    }
+
+    fn on_draft_key(&mut self, code: KeyCode, modifiers: KeyModifiers) {
+        let Some(draft) = &mut self.comment_draft else {
+            return;
+        };
+        match code {
+            KeyCode::Esc => self.comment_draft = None,
+            KeyCode::Backspace => {
+                draft.body.pop();
+            }
+            KeyCode::Enter if modifiers.contains(KeyModifiers::ALT) => draft.body.push('\n'),
+            KeyCode::Enter => {
+                let draft = self.comment_draft.take().unwrap();
+                if draft.body.trim().is_empty() {
+                    self.notice = Some("empty comment discarded".into());
+                    return;
+                }
+                let scope_label = match &self.screen {
+                    Screen::Review(r) => r.scope.label(),
+                    _ => String::new(),
+                };
+                let result = match (draft.editing, draft.target) {
+                    (Some(id), _) => self.store.edit(id, draft.body),
+                    (None, Some(t)) => self.store.add(
+                        t.path,
+                        t.new_side,
+                        t.lines,
+                        t.snippet,
+                        draft.body,
+                        scope_label,
+                    ),
+                    (None, None) => Ok(()),
+                };
+                if let Err(e) = result {
+                    self.error = Some(format!("{e:#}"));
+                }
+                self.rebuild_review();
+            }
+            KeyCode::Char(c) => draft.body.push(c),
+            _ => {}
+        }
+    }
+
+    /// Re-place comments and rebuild the stream, preserving position.
+    fn rebuild_review(&mut self) {
+        let Screen::Review(review) = &mut self.screen else {
+            return;
+        };
+        let anchor = review.stream.anchor(&review.diff.files);
+        let query = review.stream.search_query();
+        let placed = place(&review.diff, &self.store.comments);
+        review.stream = Stream::new(&review.diff, &placed, &self.store.comments);
+        let collapsed = review.tree.collapsed_dirs();
+        review.tree = FileTree::new(
+            &review.diff.files,
+            &comment_counts(&review.diff, &self.store),
+        );
+        review.tree.apply_collapsed(&collapsed);
+        if let Some(q) = &query {
+            review.stream.set_search(q, &review.diff.files);
+        }
+        if let Some(a) = &anchor {
+            review.stream.restore(a, &review.diff.files);
+        }
+        sync_tree(review);
     }
 
     fn on_search_input_key(&mut self, code: KeyCode) {
@@ -654,6 +791,17 @@ impl App {
                 KeyCode::PageUp => review.stream.move_cursor(-20),
                 KeyCode::Char('y') => self.copy_selection(false),
                 KeyCode::Char('Y') => self.copy_selection(true),
+                KeyCode::Char('c') => {
+                    if let Some(t) = review.stream.selection_target(&review.diff.files) {
+                        review.stream.cancel_selection();
+                        self.comment_draft = Some(CommentDraft {
+                            body: String::new(),
+                            editing: None,
+                            label: target_label(&t),
+                            target: Some(t),
+                        });
+                    }
+                }
                 _ => {}
             }
             return;
@@ -671,6 +819,46 @@ impl App {
                 review.stream.start_selection();
             }
             KeyCode::Char('o') => self.open_file_view(),
+            KeyCode::Char('c') => {
+                if let Some(ci) = review.stream.comment_at_top() {
+                    let c = &self.store.comments[ci];
+                    self.comment_draft = Some(CommentDraft {
+                        body: c.body.clone(),
+                        editing: Some(c.id),
+                        target: None,
+                        label: format!("edit #{} on {}", c.id, c.path),
+                    });
+                } else if let Some(t) = review.stream.line_target(&review.diff.files) {
+                    self.comment_draft = Some(CommentDraft {
+                        body: String::new(),
+                        editing: None,
+                        label: target_label(&t),
+                        target: Some(t),
+                    });
+                }
+            }
+            KeyCode::Char('d') if !modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Some(ci) = review.stream.comment_at_top() {
+                    let id = self.store.comments[ci].id;
+                    if let Err(e) = self.store.delete(id) {
+                        self.error = Some(format!("{e:#}"));
+                    } else {
+                        self.notice = Some(format!("deleted comment #{id}"));
+                    }
+                    self.rebuild_review();
+                }
+            }
+            KeyCode::Char('D') if !self.store.comments.is_empty() => {
+                self.confirm_clear = true;
+            }
+            KeyCode::Char('}') => {
+                review.stream.next_comment();
+                sync_tree(review);
+            }
+            KeyCode::Char('{') => {
+                review.stream.prev_comment();
+                sync_tree(review);
+            }
             KeyCode::Char('E') => {
                 if let Some((fi, line)) = review.stream.current_position(&review.diff.files) {
                     let path = review.diff.files[fi].path.clone();
@@ -833,13 +1021,30 @@ impl App {
         self.seq += 1; // invalidate any in-flight reload
         self.reloading = false;
         match diff::load(&self.repo, &scope) {
-            Ok(diff) => self.screen = Screen::Review(Box::new(ReviewState::new(scope, diff))),
+            Ok(diff) => {
+                self.screen = Screen::Review(Box::new(ReviewState::new(scope, diff, &self.store)))
+            }
             Err(e) => self.error = Some(format!("{e:#}")),
         }
     }
 
     fn open_picker(&mut self) {
         self.screen = Screen::Picker(build_picker(&self.repo));
+    }
+}
+
+fn comment_counts(diff: &DiffResult, store: &CommentStore) -> Vec<usize> {
+    diff.files
+        .iter()
+        .map(|f| store.count_for_path(&f.path))
+        .collect()
+}
+
+fn target_label(t: &CommentTarget) -> String {
+    if t.lines.0 == t.lines.1 {
+        format!("{}:{}", t.path, t.lines.0)
+    } else {
+        format!("{}:{}-{}", t.path, t.lines.0, t.lines.1)
     }
 }
 
@@ -888,7 +1093,13 @@ fn build_picker(repo: &Repository) -> ScopePicker {
     ScopePicker::new(items)
 }
 
-fn draw_review(review: &mut ReviewState, frame: &mut Frame, area: Rect, hl: &Highlighter) {
+fn draw_review(
+    review: &mut ReviewState,
+    frame: &mut Frame,
+    area: Rect,
+    hl: &Highlighter,
+    comments: &[crate::comments::Comment],
+) {
     if let Some(view) = &review.file_view {
         view.render(frame, area);
         return;
@@ -921,26 +1132,28 @@ fn draw_review(review: &mut ReviewState, frame: &mut Frame, area: Rect, hl: &Hig
             frame,
             stream_area,
             &review.diff.files,
+            comments,
             review.focus == Focus::Stream,
             hl,
         );
     } else {
         review
             .stream
-            .render(frame, area, &review.diff.files, true, hl);
+            .render(frame, area, &review.diff.files, comments, true, hl);
     }
 }
 
 /// Swap in a freshly loaded diff, preserving the reader's position (by file
 /// path + offset), the tree's fold state, and focus.
-fn apply_reload(review: &mut ReviewState, diff: DiffResult) {
+fn apply_reload(review: &mut ReviewState, diff: DiffResult, store: &CommentStore) {
     let anchor = review.stream.anchor(&review.diff.files);
     let collapsed = review.tree.collapsed_dirs();
     let query = review.stream.search_query();
 
     review.diff = diff;
-    review.stream = Stream::new(&review.diff);
-    review.tree = FileTree::new(&review.diff.files);
+    let placed = place(&review.diff, &store.comments);
+    review.stream = Stream::new(&review.diff, &placed, &store.comments);
+    review.tree = FileTree::new(&review.diff.files, &comment_counts(&review.diff, store));
     review.tree.apply_collapsed(&collapsed);
     // Re-run a live search against the new content, but let the anchor
     // (applied below) win over the jump-to-first-match.

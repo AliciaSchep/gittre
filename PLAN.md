@@ -173,10 +173,25 @@ expand" row.
   6. ✅ **Syntax highlighting** (`syntect`, per-visible-line, cached,
      independent per-line like delta; add/remove stays as bg tint).
 
+  7. **Persistent cursor** (planned; do before or alongside M5.2): promote the
+     select-mode cursor to a permanent `cursor` field on `Stream`, rendered
+     every frame. `j`/`k`, paging, and `g`/`G` move the cursor vim-style (view
+     follows via the existing `move_cursor` clamp/keep-in-view logic); jumps
+     (`]`/`[`, `n`/`p`, search, tree Enter) set it. Position-dependent reads
+     (`current_file`, `current_position`, `comment_at_top`, `line_target`)
+     switch from `self.scroll` to the cursor row, so `c`/`o`/`E`/`d` act on
+     the highlighted line instead of the top of the screen. Select mode
+     collapses to "`v` sets anchor = cursor". Follow-ons: click in the stream
+     sets the cursor; reload anchor/restore and tree sync track the cursor
+     row. No data-model or storage changes.
+
   Deferred to a later phase: **side-by-side view** (`s` toggle, auto-fallback
   when narrow).
-- **M5 — commenting** (design TBD, see §7). Line/range comments, persistence,
-  markdown export. Builds on the M4 cursor/selection.
+- **M5 — commenting** (design settled, see §7). Sub-milestones:
+  1. Model + storage + add/edit/delete + inline rendering + counts.
+  2. Re-anchoring engine + outdated handling (GitHub-style).
+  3. Markdown export (`e` popup + headless `gittre export`).
+  4. Polish: comment navigation, maybe resolve state (deferred).
 
 Each milestone is shippable; M1–M3 is already a useful daily tool.
 
@@ -191,28 +206,30 @@ Each milestone is shippable; M1–M3 is already a useful daily tool.
 - Keys `c`, `v`, `e`, `d` are **reserved unbound** in the review screen so
   commenting can claim them later without breaking habits.
 
-## 7. Deferred: commenting (parked design, needs more thought)
+## 7. M5 commenting design (settled)
 
-Nothing here is committed — this is the earlier sketch, kept so v1 decisions
-stay compatible with it.
+Modeled on how GitHub handles review comments and staleness: a comment owns
+its context forever (it stores a snippet of the code it was made on), so a
+failed re-anchor degrades to an **"outdated"** display state instead of data
+loss.
 
-- **UX sketch:** `c` on a line opens a text popup; `v` selects a line range,
-  then `c` comments on it. Comments render inline under the anchored lines;
-  counts badge the file tree. `e` exports to markdown grouped by file, each
-  comment with a fenced snippet of its anchored lines.
-- **Model sketch:** comment = scope key (commit sha / range / working-tree /
-  staged / branch-base) + path + side (old/new) + line range + captured code
-  snippet + body + timestamp.
-- **Storage idea:** JSON at `.git/gittre/comments.json` — inside `.git/` so it
-  never touches the working tree and needs no gitignore entry.
-- **Hard problem to think through:** re-anchoring comments when a live diff
-  changes underneath (exact-line match, then snippet search, then an "orphaned"
-  bucket rather than silent loss). This is where the subtle bugs live and the
-  main reason the feature is deferred.
-- **Open questions:** per-scope vs. cross-scope comments; single reviewer vs.
-  shareable/tracked comment files; whether export should also be a headless
-  `gittre export` subcommand; comment threads/replies or flat notes.
-
-**V1 compatibility requirements** (what the deferred design asks of v1):
-diff rendering keeps stable per-file/per-line identities (needed for anchoring),
-popups are a generic widget, and the reserved keys above stay free.
+- **Model:** id, path, side (new/old), line range, captured snippet (the
+  selected lines, signs included), body, created-at, scope label (metadata),
+  outdated flag.
+- **Pool:** one per repo — like a PR review. A comment appears in whichever
+  scope its anchor matches (comment on uncommitted work, still see it when
+  reviewing the branch after committing). Scope at creation is metadata only.
+- **Anchoring:** file line numbers + snippet, never diff-row indices.
+  Re-anchor cascade on every (re)load: exact (snippet still at stored lines)
+  → moved (snippet found elsewhere in the file; position updated) → outdated
+  (collapsed "⚠ n outdated" row at the top of the file's section, expandable,
+  showing the preserved snippet).
+- **UX:** `v` select → `c` comment (Enter saves, Alt+Enter newline, Esc
+  cancels); bare `c` comments the current line. Inline blocks with a colored
+  gutter bar; counts in tree + title. `}`/`{` jump between comments; on a
+  comment: `c` edits, `d` deletes. `D` deletes **all** comments (confirm
+  prompt) to start a review anew. No resolve state for now (revisit later).
+- **Storage:** JSON at `<gitdir>/gittre/comments.json` — never touches the
+  working tree; linked worktrees get their own review (separate gitdir).
+- **Export (M5.3):** markdown grouped by file — line refs, fenced snippet,
+  body; outdated flagged. `e` popup for the path; also `gittre export`.
