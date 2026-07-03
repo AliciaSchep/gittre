@@ -229,6 +229,46 @@ impl CommentStore {
     }
 }
 
+/// Render all comments as markdown, grouped by file, ordered by line.
+/// Outdated comments are flagged; the preserved snippet gives context either
+/// way.
+pub fn export_markdown(comments: &[Comment], title: &str, date: &str) -> String {
+    let mut sorted: Vec<&Comment> = comments.iter().collect();
+    sorted.sort_by(|a, b| a.path.cmp(&b.path).then(a.lines.0.cmp(&b.lines.0)));
+
+    let mut out = format!("# Review comments — {title} ({date})\n");
+    let mut current_path = "";
+    for c in sorted {
+        if c.path != current_path {
+            current_path = &c.path;
+            out.push_str(&format!("\n## {}\n", c.path));
+        }
+        let range = if c.lines.0 == c.lines.1 {
+            format!("L{}", c.lines.0)
+        } else {
+            format!("L{}–L{}", c.lines.0, c.lines.1)
+        };
+        let side = if c.new_side { "" } else { ", old side" };
+        let outdated = if c.outdated { " · ⚠ outdated" } else { "" };
+        out.push_str(&format!(
+            "\n**{range}**{side} · _{}_{outdated}\n\n",
+            c.scope
+        ));
+        if !c.snippet.is_empty() {
+            out.push_str("```diff\n");
+            for line in &c.snippet {
+                out.push_str(line);
+                out.push('\n');
+            }
+            out.push_str("```\n\n");
+        }
+        for line in c.body.lines() {
+            out.push_str(&format!("> {line}\n"));
+        }
+    }
+    out
+}
+
 fn now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -387,6 +427,23 @@ mod tests {
         let (placed, _) = reanchor(&diff, &mut comments);
         assert!(placed.is_empty());
         assert!(!comments[0].outdated, "untouched when file absent");
+    }
+
+    #[test]
+    fn export_groups_and_flags() {
+        let mut a = comment("b.rs", 5);
+        a.body = "second file".into();
+        let mut b = comment("a.rs", 9);
+        b.id = 2;
+        b.body = "line one\nline two".into();
+        b.outdated = true;
+        let md = export_markdown(&[a, b], "demo", "2026-07-03");
+        let a_pos = md.find("## a.rs").unwrap();
+        let b_pos = md.find("## b.rs").unwrap();
+        assert!(a_pos < b_pos, "files sorted");
+        assert!(md.contains("⚠ outdated"));
+        assert!(md.contains("```diff\n+line 9\n```"));
+        assert!(md.contains("> line one\n> line two"));
     }
 
     #[test]

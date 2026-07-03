@@ -10,7 +10,7 @@ use ratatui::crossterm::event::{
 use ratatui::prelude::*;
 use ratatui::widgets::Paragraph;
 
-use crate::comments::CommentStore;
+use crate::comments::{CommentStore, export_markdown};
 use crate::event::{AppEvent, LoadRequest, spawn_loader};
 use crate::git::diff::{self, DiffResult};
 use crate::git::log::commit_log;
@@ -79,6 +79,8 @@ pub struct App {
     reloaded_at: Option<Instant>,
     /// In-progress `/` query; Some while the user is typing it.
     search_input: Option<String>,
+    /// Output path being typed for markdown export.
+    export_input: Option<String>,
     /// Transient confirmation shown in the title bar (e.g. "copied 12 lines").
     notice: Option<String>,
     /// $EDITOR launch requested by `E`; handled in the run loop where the
@@ -131,6 +133,7 @@ impl App {
             reloading: false,
             reloaded_at: None,
             search_input: None,
+            export_input: None,
             notice: None,
             pending_editor: None,
             highlighter: Highlighter::new(),
@@ -337,9 +340,12 @@ impl App {
             ),
         }
 
-        match &self.search_input {
-            Some(query) => bar::render_search_input(frame, bar_area, query),
-            None => bar::render(frame, bar_area, &self.hints()),
+        if let Some(query) = &self.search_input {
+            bar::render_input(frame, bar_area, "/", query, "search");
+        } else if let Some(path) = &self.export_input {
+            bar::render_input(frame, bar_area, "export to ", path, "write");
+        } else {
+            bar::render(frame, bar_area, &self.hints());
         }
 
         if let Some(draft) = &self.comment_draft {
@@ -404,6 +410,9 @@ impl App {
         }
         if self.search_input.is_some() {
             return vec![("⏎", "search"), ("Esc", "cancel")];
+        }
+        if self.export_input.is_some() {
+            return vec![("⏎", "write file"), ("Esc", "cancel")];
         }
         match &self.screen {
             Screen::Picker(picker) => vec![
@@ -534,6 +543,10 @@ impl App {
             self.on_search_input_key(code);
             return;
         }
+        if self.export_input.is_some() {
+            self.on_export_input_key(code);
+            return;
+        }
         if code == KeyCode::Char('?') {
             self.show_help = true;
             return;
@@ -611,6 +624,45 @@ impl App {
             review.stream.restore(a, &review.diff.files);
         }
         sync_tree(review);
+    }
+
+    fn on_export_input_key(&mut self, code: KeyCode) {
+        let Some(input) = &mut self.export_input else {
+            return;
+        };
+        match code {
+            KeyCode::Esc => self.export_input = None,
+            KeyCode::Backspace => {
+                input.pop();
+            }
+            KeyCode::Enter => {
+                let path = self.export_input.take().unwrap_or_default();
+                if path.trim().is_empty() {
+                    return;
+                }
+                let md = export_markdown(
+                    &self.store.comments,
+                    &repo_title(&self.repo),
+                    &today_string(),
+                );
+                match std::fs::write(&path, md) {
+                    Ok(()) => {
+                        self.notice = Some(format!(
+                            "exported {} comment{} to {path}",
+                            self.store.comments.len(),
+                            if self.store.comments.len() == 1 {
+                                ""
+                            } else {
+                                "s"
+                            },
+                        ))
+                    }
+                    Err(e) => self.error = Some(format!("export failed: {e}")),
+                }
+            }
+            KeyCode::Char(c) => input.push(c),
+            _ => {}
+        }
     }
 
     fn on_search_input_key(&mut self, code: KeyCode) {
@@ -818,6 +870,13 @@ impl App {
                 review.stream.start_selection();
             }
             KeyCode::Char('o') => self.open_file_view(),
+            KeyCode::Char('e') => {
+                if self.store.comments.is_empty() {
+                    self.error = Some("no comments to export".into());
+                } else {
+                    self.export_input = Some(format!("review-{}.md", today_string()));
+                }
+            }
             KeyCode::Char('c') => {
                 if let Some(ci) = review.stream.comment_at_cursor() {
                     let c = &self.store.comments[ci];
@@ -1039,6 +1098,33 @@ impl App {
     fn open_picker(&mut self) {
         self.screen = Screen::Picker(build_picker(&self.repo));
     }
+}
+
+fn repo_title(repo: &Repository) -> String {
+    repo.workdir()
+        .and_then(|p| p.file_name())
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "repository".into())
+}
+
+pub fn today_string() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let days = secs / 86_400;
+    // civil-from-days (Howard Hinnant's algorithm)
+    let z = days as i64 + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{y:04}-{m:02}-{d:02}")
 }
 
 fn comment_counts(diff: &DiffResult, store: &CommentStore) -> Vec<usize> {

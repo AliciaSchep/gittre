@@ -1,15 +1,15 @@
 use ratatui::prelude::*;
 use ratatui::widgets::{Paragraph, Wrap};
 
-/// The `/` search prompt, rendered in place of the command bar while typing.
-pub fn render_search_input(frame: &mut Frame, area: Rect, query: &str) {
+/// A one-line prompt (search, export path…) in place of the command bar.
+pub fn render_input(frame: &mut Frame, area: Rect, label: &str, value: &str, action: &str) {
     let line = Line::from(vec![
-        "/".bold().cyan(),
-        query.to_string().into(),
+        label.to_string().bold().cyan(),
+        value.to_string().into(),
         "▏".cyan(),
         "   ".into(),
         "[⏎]".bold().cyan(),
-        " search  ".dark_gray(),
+        format!(" {action}  ").dark_gray(),
         "[Esc]".bold().cyan(),
         " cancel".dark_gray(),
     ]);

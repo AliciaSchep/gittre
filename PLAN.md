@@ -188,10 +188,10 @@ expand" row.
   Deferred to a later phase: **side-by-side view** (`s` toggle, auto-fallback
   when narrow).
 - **M5 — commenting** (design settled, see §7). Sub-milestones:
-  1. Model + storage + add/edit/delete + inline rendering + counts.
-  2. Re-anchoring engine + outdated handling (GitHub-style).
-  3. Markdown export (`e` popup + headless `gittre export`).
-  4. Polish: comment navigation, maybe resolve state (deferred).
+  1. ✅ Model + storage + add/edit/delete + inline rendering + counts.
+  2. ✅ Re-anchoring engine + outdated handling (GitHub-style).
+  3. ✅ Markdown export (`e` popup + headless `gittre export [-o PATH]`).
+  4. Polish: `}`/`{` comment navigation ✅; resolve state deferred.
 
 Each milestone is shippable; M1–M3 is already a useful daily tool.
 

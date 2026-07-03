@@ -6,7 +6,7 @@ mod ui;
 mod watch;
 
 use anyhow::{Context, Result, bail};
-use clap::Parser;
+use clap::{Parser, Subcommand};
 
 use git::scope::Scope;
 
@@ -16,6 +16,9 @@ use git::scope::Scope;
 #[derive(Parser)]
 #[command(version, about)]
 struct Args {
+    #[command(subcommand)]
+    command: Option<Command>,
+
     /// Review a commit (sha, ref, HEAD~2) or a range (a..b, a...b)
     rev: Option<String>,
 
@@ -70,11 +73,44 @@ impl Args {
     }
 }
 
+#[derive(Subcommand)]
+enum Command {
+    /// Print review comments as markdown (or write with -o)
+    Export {
+        /// Write to a file instead of stdout
+        #[arg(short, long, value_name = "PATH")]
+        output: Option<std::path::PathBuf>,
+    },
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
 
     let repo = git2::Repository::discover(&args.repo)
         .with_context(|| format!("not a git repository: {}", args.repo.display()))?;
+
+    if let Some(Command::Export { output }) = &args.command {
+        let store = comments::CommentStore::load(&repo);
+        let title = repo
+            .workdir()
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "repository".into());
+        let date = app::today_string();
+        let md = comments::export_markdown(&store.comments, &title, &date);
+        match output {
+            Some(path) => {
+                std::fs::write(path, md).with_context(|| format!("writing {}", path.display()))?;
+                eprintln!(
+                    "exported {} comments to {}",
+                    store.comments.len(),
+                    path.display()
+                );
+            }
+            None => print!("{md}"),
+        }
+        return Ok(());
+    }
 
     // Resolve and load any CLI-selected scope before entering raw mode, so
     // errors print as plain text instead of garbling the terminal.
