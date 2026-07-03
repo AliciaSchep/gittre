@@ -123,17 +123,6 @@ impl Stream {
         }
     }
 
-    /// Selected rows count (for the "copied N lines" notice).
-    pub fn selection_len(&self) -> usize {
-        self.selection
-            .as_ref()
-            .map(|s| {
-                let (lo, hi) = s.range();
-                hi - lo + 1
-            })
-            .unwrap_or(0)
-    }
-
     /// Text of the selection. `patch_style` keeps +/- signs and hunk headers;
     /// otherwise returns clean new-side code (deletions skipped).
     pub fn selected_text(&self, files: &[FileDiff], patch_style: bool) -> Option<String> {
@@ -299,6 +288,22 @@ impl Stream {
             self.scroll = (start + rel).min(end.saturating_sub(1));
         }
         self.scroll = self.scroll.min(self.scroll_limit());
+    }
+
+    /// The first content row at or below the top of the viewport:
+    /// (file index, 1-based line number on the new side when known).
+    pub fn current_position(&self, files: &[FileDiff]) -> Option<(usize, Option<u32>)> {
+        self.rows
+            .iter()
+            .skip(self.scroll)
+            .find_map(|row| match *row {
+                Row::Line(fi, hi, li) => {
+                    let line = &files[fi].hunks[hi].lines[li];
+                    Some((fi, line.new_lineno.or(line.old_lineno)))
+                }
+                Row::FileHeader(fi) => Some((fi, None)),
+                _ => None,
+            })
     }
 
     /// Index of the file whose content is at the top of the viewport.

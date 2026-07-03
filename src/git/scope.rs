@@ -161,6 +161,69 @@ pub fn commit_scope(repo: &Repository, rev: &str) -> Result<Scope> {
     })
 }
 
+/// Full content of a file as it exists on the *new* side of a scope's diff,
+/// plus a short label describing where it came from. Falls back to the old
+/// side for deleted files.
+pub fn file_content(repo: &Repository, scope: &Scope, path: &str) -> Result<(String, String)> {
+    let from_disk = || -> Option<(String, String)> {
+        let full = repo.workdir()?.join(path);
+        std::fs::read(&full).ok().map(|bytes| {
+            (
+                String::from_utf8_lossy(&bytes).into_owned(),
+                "working tree".into(),
+            )
+        })
+    };
+    let from_tree = |tree: &git2::Tree, label: String| -> Option<(String, String)> {
+        let entry = tree.get_path(std::path::Path::new(path)).ok()?;
+        let blob = repo.find_blob(entry.id()).ok()?;
+        Some((String::from_utf8_lossy(blob.content()).into_owned(), label))
+    };
+    let head_commit_tree = || repo.head().ok().and_then(|h| h.peel_to_tree().ok());
+
+    let content = match scope {
+        Scope::Uncommitted => from_disk().or_else(|| {
+            // Deleted from the working tree: show what HEAD had.
+            head_commit_tree().and_then(|t| from_tree(&t, "HEAD".into()))
+        }),
+        Scope::Staged => {
+            // The staged (index) version, else HEAD's for deletions.
+            let from_index = || -> Option<(String, String)> {
+                let index = repo.index().ok()?;
+                let entry = index.get_path(std::path::Path::new(path), 0)?;
+                let blob = repo.find_blob(entry.id).ok()?;
+                Some((
+                    String::from_utf8_lossy(blob.content()).into_owned(),
+                    "index".into(),
+                ))
+            };
+            from_index().or_else(|| head_commit_tree().and_then(|t| from_tree(&t, "HEAD".into())))
+        }
+        Scope::Branch { base } => head_commit_tree()
+            .and_then(|t| from_tree(&t, "HEAD".into()))
+            .or_else(|| {
+                // Deleted on the branch: show the base's version.
+                let tree = repo
+                    .revparse_single(base)
+                    .ok()?
+                    .peel_to_commit()
+                    .ok()?
+                    .tree()
+                    .ok()?;
+                from_tree(&tree, base.clone())
+            }),
+        Scope::Commit { id, .. } => {
+            let commit = repo.find_commit(*id).context("finding commit")?;
+            from_tree(&commit.tree()?, format!("{id:.7}")).or_else(|| {
+                // Deleted by this commit: show the parent's version.
+                let parent = commit.parent(0).ok()?;
+                from_tree(&parent.tree().ok()?, format!("{:.7}", parent.id()))
+            })
+        }
+    };
+    content.ok_or_else(|| anyhow!("no content found for '{path}' in this scope"))
+}
+
 fn head_tree(repo: &Repository) -> Result<Option<git2::Tree<'_>>> {
     match repo.head() {
         Ok(head) => Ok(Some(head.peel_to_tree().context("resolving HEAD tree")?)),

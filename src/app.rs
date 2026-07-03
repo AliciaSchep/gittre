@@ -13,7 +13,8 @@ use ratatui::widgets::Paragraph;
 use crate::event::{AppEvent, LoadRequest, spawn_loader};
 use crate::git::diff::{self, DiffResult};
 use crate::git::log::commit_log;
-use crate::git::scope::{Scope, base_candidates, detect_base, file_count};
+use crate::git::scope::{Scope, base_candidates, detect_base, file_content, file_count};
+use crate::ui::fileview::FileView;
 use crate::ui::picker::{BasePicker, LogPicker, ScopeAction, ScopeItem, ScopePicker};
 use crate::ui::review::Stream;
 use crate::ui::tree::FileTree;
@@ -33,6 +34,8 @@ struct ReviewState {
     tree: FileTree,
     focus: Focus,
     show_tree: bool,
+    /// Full-file pager overlay (`o`).
+    file_view: Option<FileView>,
 }
 
 impl ReviewState {
@@ -46,6 +49,7 @@ impl ReviewState {
             tree,
             focus: Focus::Stream,
             show_tree: true,
+            file_view: None,
         }
     }
 }
@@ -74,6 +78,9 @@ pub struct App {
     search_input: Option<String>,
     /// Transient confirmation shown in the title bar (e.g. "copied 12 lines").
     notice: Option<String>,
+    /// $EDITOR launch requested by `E`; handled in the run loop where the
+    /// terminal handle is available for suspend/resume.
+    pending_editor: Option<(std::path::PathBuf, usize)>,
 }
 
 const TREE_WIDTH: u16 = 32;
@@ -104,6 +111,7 @@ impl App {
             reloaded_at: None,
             search_input: None,
             notice: None,
+            pending_editor: None,
         }
     }
 
@@ -122,8 +130,49 @@ impl App {
             while let Ok(app_event) = self.events.try_recv() {
                 self.on_app_event(app_event);
             }
+            if let Some((path, line)) = self.pending_editor.take() {
+                self.run_editor(terminal, &path, line);
+            }
         }
         Ok(())
+    }
+
+    /// Suspend the TUI, run $EDITOR at file:line, resume. Any edits the
+    /// editor saves are picked up by the auto-reload watcher.
+    fn run_editor(&mut self, terminal: &mut DefaultTerminal, path: &std::path::Path, line: usize) {
+        use ratatui::crossterm::event::{DisableMouseCapture, EnableMouseCapture};
+        use ratatui::crossterm::execute;
+        use ratatui::crossterm::terminal::{
+            EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+        };
+
+        let editor = std::env::var("VISUAL")
+            .ok()
+            .filter(|v| !v.is_empty())
+            .or_else(|| std::env::var("EDITOR").ok().filter(|v| !v.is_empty()))
+            .unwrap_or_else(|| "vi".into());
+        let mut parts = editor.split_whitespace();
+        let Some(program) = parts.next() else {
+            return;
+        };
+        let args: Vec<&str> = parts.collect();
+
+        let _ = execute!(std::io::stdout(), LeaveAlternateScreen, DisableMouseCapture);
+        let _ = disable_raw_mode();
+        let status = std::process::Command::new(program)
+            .args(&args)
+            .arg(format!("+{line}"))
+            .arg(path)
+            .status();
+        let _ = enable_raw_mode();
+        let _ = execute!(std::io::stdout(), EnterAlternateScreen, EnableMouseCapture);
+        let _ = terminal.clear();
+
+        match status {
+            Ok(st) if st.success() => {}
+            Ok(st) => self.error = Some(format!("{editor} exited with {st}")),
+            Err(e) => self.error = Some(format!("failed to launch {editor}: {e}")),
+        }
     }
 
     fn on_mouse(&mut self, mouse: MouseEvent) {
@@ -326,6 +375,14 @@ impl App {
             Screen::Review(review) => {
                 if review.diff.files.is_empty() {
                     return vec![("x/q", "switch scope"), ("?", "help")];
+                }
+                if review.file_view.is_some() {
+                    return vec![
+                        ("↑↓/jk", "scroll"),
+                        ("g/G", "top/bottom"),
+                        ("E", "open in $EDITOR"),
+                        ("q/Esc", "back to diff"),
+                    ];
                 }
                 if review.stream.has_selection() {
                     return vec![
@@ -545,6 +602,28 @@ impl App {
         let Screen::Review(review) = &mut self.screen else {
             return;
         };
+        if let Some(view) = &mut review.file_view {
+            match code {
+                KeyCode::Char('q') | KeyCode::Esc | KeyCode::Char('o') => {
+                    review.file_view = None;
+                }
+                KeyCode::Char('j') | KeyCode::Down => view.scroll_by(1),
+                KeyCode::Char('k') | KeyCode::Up => view.scroll_by(-1),
+                KeyCode::PageDown => view.page(1),
+                KeyCode::PageUp => view.page(-1),
+                KeyCode::Char('d') if modifiers.contains(KeyModifiers::CONTROL) => view.page(1),
+                KeyCode::Char('u') if modifiers.contains(KeyModifiers::CONTROL) => view.page(-1),
+                KeyCode::Char('g') | KeyCode::Home => view.scroll_to_top(),
+                KeyCode::Char('G') | KeyCode::End => view.scroll_to_bottom(),
+                KeyCode::Char('E') => {
+                    let line = view.top_line();
+                    let path = view.path.clone();
+                    self.request_editor(&path, line);
+                }
+                _ => {}
+            }
+            return;
+        }
         if review.stream.has_selection() {
             match code {
                 KeyCode::Esc | KeyCode::Char('v') => review.stream.cancel_selection(),
@@ -569,6 +648,14 @@ impl App {
             KeyCode::Char('/') => self.search_input = Some(String::new()),
             KeyCode::Char('v') if review.focus == Focus::Stream => {
                 review.stream.start_selection();
+            }
+            KeyCode::Char('o') => self.open_file_view(),
+            KeyCode::Char('E') => {
+                if let Some((fi, line)) = review.stream.current_position(&review.diff.files) {
+                    let path = review.diff.files[fi].path.clone();
+                    let line = line.unwrap_or(1) as usize;
+                    self.request_editor(&path, line);
+                }
             }
             KeyCode::Char('n') if review.stream.has_search() => {
                 review.stream.next_match();
@@ -661,6 +748,37 @@ impl App {
 
     // ---- transitions ------------------------------------------------------
 
+    fn open_file_view(&mut self) {
+        let Screen::Review(review) = &mut self.screen else {
+            return;
+        };
+        let Some((fi, line)) = review.stream.current_position(&review.diff.files) else {
+            return;
+        };
+        let path = review.diff.files[fi].path.clone();
+        match file_content(&self.repo, &review.scope, &path) {
+            Ok((content, source)) => {
+                let target = line.map(|l| l.saturating_sub(1) as usize);
+                review.file_view = Some(FileView::new(path, source, &content, target));
+            }
+            Err(e) => self.error = Some(format!("{e:#}")),
+        }
+    }
+
+    /// Queue an $EDITOR launch if the file exists on disk.
+    fn request_editor(&mut self, path: &str, line: usize) {
+        let Some(workdir) = self.repo.workdir() else {
+            self.error = Some("no working directory".into());
+            return;
+        };
+        let full = workdir.join(path);
+        if !full.exists() {
+            self.error = Some(format!("{path} is not on disk (deleted or historical)"));
+            return;
+        }
+        self.pending_editor = Some((full, line.max(1)));
+    }
+
     fn copy_selection(&mut self, patch_style: bool) {
         let Screen::Review(review) = &mut self.screen else {
             return;
@@ -744,6 +862,10 @@ fn build_picker(repo: &Repository) -> ScopePicker {
 }
 
 fn draw_review(review: &mut ReviewState, frame: &mut Frame, area: Rect) {
+    if let Some(view) = &review.file_view {
+        view.render(frame, area);
+        return;
+    }
     if review.diff.files.is_empty() {
         let msg = Paragraph::new(Line::from(
             format!("✔ {}", review.scope.empty_message()).green(),

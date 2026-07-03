@@ -11,6 +11,8 @@ const HELP: &[(&str, &str)] = &[
     ("/", "search the diff"),
     ("n / N", "next / previous match while a search is live"),
     ("v", "select lines; then y copies code, Y copies a patch"),
+    ("o", "view the full file (read-only, at the current line)"),
+    ("E", "open the file in $EDITOR at the current line"),
     ("Tab", "pick a file from the tree (Esc cancels)"),
     ("⏎", "open the selected file / entry"),
     ("t", "show / hide the file tree"),
