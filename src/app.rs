@@ -360,12 +360,24 @@ impl App {
             .into_iter()
             .take(if picker.items.is_empty() { 2 } else { 5 })
             .collect(),
-            Screen::Log(_) => vec![
-                ("↑↓/jk", "select"),
-                ("⏎", "review commit"),
-                ("q/Esc", "back"),
-                ("?", "help"),
-            ],
+            Screen::Log(log) => {
+                if log.marked.is_some() {
+                    vec![
+                        ("↑↓/jk", "select"),
+                        ("⏎", "review marked ⇢ selected"),
+                        ("Space", "unmark"),
+                        ("q/Esc", "back"),
+                    ]
+                } else {
+                    vec![
+                        ("↑↓/jk", "select"),
+                        ("⏎", "review commit"),
+                        ("Space", "mark range start"),
+                        ("q/Esc", "back"),
+                        ("?", "help"),
+                    ]
+                }
+            }
             Screen::Base(_) => vec![
                 ("↑↓/jk", "select"),
                 ("⏎", "compare against"),
@@ -580,6 +592,7 @@ impl App {
             KeyCode::PageUp => log.move_selection(-20),
             KeyCode::Char('g') | KeyCode::Home => log.selected = 0,
             KeyCode::Char('G') | KeyCode::End => log.selected = log.entries.len().saturating_sub(1),
+            KeyCode::Char(' ') => log.toggle_mark(),
             KeyCode::Enter => self.open_selected_commit(),
             _ => {}
         }
@@ -589,13 +602,18 @@ impl App {
         let Screen::Log(log) = &self.screen else {
             return;
         };
-        if let Some(entry) = log.entries.get(log.selected) {
-            let scope = Scope::Commit {
+        let Some(entry) = log.entries.get(log.selected) else {
+            return;
+        };
+        let scope = match log.marked {
+            // A marked base + a different selection = review the range.
+            Some(from) if from != entry.id => Scope::Range { from, to: entry.id },
+            _ => Scope::Commit {
                 id: entry.id,
                 summary: entry.summary.clone(),
-            };
-            self.open_scope(scope);
-        }
+            },
+        };
+        self.open_scope(scope);
     }
 
     fn on_review_key(&mut self, code: KeyCode, modifiers: KeyModifiers) {

@@ -144,6 +144,8 @@ impl BasePicker {
 pub struct LogPicker {
     pub entries: Vec<LogEntry>,
     pub selected: usize,
+    /// Range base marked with Space; Enter then reviews marked..selected.
+    pub marked: Option<git2::Oid>,
     pub state: ListState,
     last_inner: Cell<Rect>,
 }
@@ -153,9 +155,21 @@ impl LogPicker {
         LogPicker {
             entries,
             selected: 0,
+            marked: None,
             state: ListState::default(),
             last_inner: Cell::new(Rect::default()),
         }
+    }
+
+    /// Space: mark the selected commit as range base (again to unmark).
+    pub fn toggle_mark(&mut self) {
+        let Some(entry) = self.entries.get(self.selected) else {
+            return;
+        };
+        self.marked = match self.marked {
+            Some(m) if m == entry.id => None,
+            _ => Some(entry.id),
+        };
     }
 
     pub fn hit(&self, column: u16, row: u16) -> Option<usize> {
@@ -180,8 +194,14 @@ impl LogPicker {
             .entries
             .iter()
             .map(|e| {
+                let marker = if self.marked == Some(e.id) {
+                    "●".cyan().bold()
+                } else {
+                    Span::raw(" ")
+                };
                 ListItem::new(Line::from(vec![
-                    format!(" {} ", e.short).yellow(),
+                    marker,
+                    format!("{} ", e.short).yellow(),
                     format!("{:>3} ", e.age).dark_gray(),
                     format!("{:<12.12} ", e.author).cyan(),
                     Span::raw(e.summary.clone()),

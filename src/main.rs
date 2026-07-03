@@ -15,7 +15,7 @@ use git::scope::Scope;
 #[derive(Parser)]
 #[command(version, about)]
 struct Args {
-    /// Review a specific commit (sha, ref, HEAD~2, …)
+    /// Review a commit (sha, ref, HEAD~2) or a range (a..b, a...b)
     rev: Option<String>,
 
     /// Review all uncommitted work (working tree + index vs HEAD)
@@ -63,7 +63,7 @@ impl Args {
             return Ok(Some(Scope::Branch { base }));
         }
         if let Some(rev) = &self.rev {
-            return Ok(Some(git::scope::commit_scope(repo, rev)?));
+            return Ok(Some(git::scope::rev_scope(repo, rev)?));
         }
         Ok(None)
     }

@@ -12,6 +12,8 @@ pub enum Scope {
     Branch { base: String },
     /// One commit vs its first parent.
     Commit { id: Oid, summary: String },
+    /// Everything between two commits: tree(from) vs tree(to).
+    Range { from: Oid, to: Oid },
 }
 
 impl Scope {
@@ -28,6 +30,7 @@ impl Scope {
                 }
                 format!("commit {id:.7} \u{201c}{s}\u{201d}")
             }
+            Scope::Range { from, to } => format!("range {from:.7}..{to:.7}"),
         }
     }
 
@@ -38,6 +41,7 @@ impl Scope {
             Scope::Staged => "no staged changes",
             Scope::Branch { .. } => "no changes vs base — branch has no commits of its own",
             Scope::Commit { .. } => "empty commit",
+            Scope::Range { .. } => "no changes between these commits",
         }
     }
 }
@@ -137,6 +141,15 @@ pub fn build_diff<'r>(repo: &'r Repository, scope: &Scope) -> Result<git2::Diff<
             repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&commit.tree()?), Some(&mut opts))
                 .context("diffing commit vs parent")?
         }
+        Scope::Range { from, to } => {
+            let from_tree = repo
+                .find_commit(*from)
+                .context("finding range start")?
+                .tree()?;
+            let to_tree = repo.find_commit(*to).context("finding range end")?.tree()?;
+            repo.diff_tree_to_tree(Some(&from_tree), Some(&to_tree), Some(&mut opts))
+                .context("diffing range")?
+        }
     };
 
     diff.find_similar(None).ok();
@@ -146,6 +159,35 @@ pub fn build_diff<'r>(repo: &'r Repository, scope: &Scope) -> Result<git2::Diff<
 /// Number of changed files in a scope, without walking file contents.
 pub fn file_count(repo: &Repository, scope: &Scope) -> usize {
     build_diff(repo, scope).map_or(0, |d| d.deltas().len())
+}
+
+/// Resolve `a..b` / `a...b` (git-diff semantics: `...` diffs from the
+/// merge base of a and b) or a single revision into a scope.
+pub fn rev_scope(repo: &Repository, spec: &str) -> Result<Scope> {
+    let (a, b, three_dot) = if let Some((a, b)) = spec.split_once("...") {
+        (a, b, true)
+    } else if let Some((a, b)) = spec.split_once("..") {
+        (a, b, false)
+    } else {
+        return commit_scope(repo, spec);
+    };
+    let resolve = |rev: &str| -> Result<Oid> {
+        let rev = if rev.is_empty() { "HEAD" } else { rev };
+        Ok(repo
+            .revparse_single(rev)
+            .with_context(|| format!("unknown revision '{rev}'"))?
+            .peel_to_commit()
+            .map_err(|_| anyhow!("'{rev}' is not a commit"))?
+            .id())
+    };
+    let mut from = resolve(a)?;
+    let to = resolve(b)?;
+    if three_dot {
+        from = repo
+            .merge_base(from, to)
+            .context("no merge base for '...' range")?;
+    }
+    Ok(Scope::Range { from, to })
 }
 
 /// Resolve a user-supplied revision string into a commit scope.
@@ -218,6 +260,14 @@ pub fn file_content(repo: &Repository, scope: &Scope, path: &str) -> Result<(Str
                 // Deleted by this commit: show the parent's version.
                 let parent = commit.parent(0).ok()?;
                 from_tree(&parent.tree().ok()?, format!("{:.7}", parent.id()))
+            })
+        }
+        Scope::Range { from, to } => {
+            let to_tree = repo.find_commit(*to).context("finding range end")?.tree()?;
+            from_tree(&to_tree, format!("{to:.7}")).or_else(|| {
+                // Deleted within the range: show the starting version.
+                let tree = repo.find_commit(*from).ok()?.tree().ok()?;
+                from_tree(&tree, format!("{from:.7}"))
             })
         }
     };
