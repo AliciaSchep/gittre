@@ -72,6 +72,8 @@ pub struct App {
     reloaded_at: Option<Instant>,
     /// In-progress `/` query; Some while the user is typing it.
     search_input: Option<String>,
+    /// Transient confirmation shown in the title bar (e.g. "copied 12 lines").
+    notice: Option<String>,
 }
 
 const TREE_WIDTH: u16 = 32;
@@ -101,6 +103,7 @@ impl App {
             reloading: false,
             reloaded_at: None,
             search_input: None,
+            notice: None,
         }
     }
 
@@ -264,6 +267,8 @@ impl App {
         let mut spans = vec![" gittre ".bold().black().on_cyan()];
         if let Some(err) = &self.error {
             spans.push(format!(" {err}").red().bold());
+        } else if let Some(notice) = &self.notice {
+            spans.push(format!(" ✔ {notice}").green());
         } else {
             match &self.screen {
                 Screen::Picker(_) => spans.push(" select what to review".dark_gray()),
@@ -322,6 +327,14 @@ impl App {
                 if review.diff.files.is_empty() {
                     return vec![("x/q", "switch scope"), ("?", "help")];
                 }
+                if review.stream.has_selection() {
+                    return vec![
+                        ("↑↓/jk", "extend"),
+                        ("y", "copy code"),
+                        ("Y", "copy patch"),
+                        ("Esc/v", "cancel"),
+                    ];
+                }
                 if review.focus == Focus::Tree {
                     return vec![
                         ("↑↓/jk", "select"),
@@ -355,6 +368,7 @@ impl App {
 
     fn on_key(&mut self, code: KeyCode, modifiers: KeyModifiers) {
         self.error = None;
+        self.notice = None;
 
         if self.show_help {
             if matches!(code, KeyCode::Char('q') | KeyCode::Esc | KeyCode::Char('?')) {
@@ -531,6 +545,19 @@ impl App {
         let Screen::Review(review) = &mut self.screen else {
             return;
         };
+        if review.stream.has_selection() {
+            match code {
+                KeyCode::Esc | KeyCode::Char('v') => review.stream.cancel_selection(),
+                KeyCode::Char('j') | KeyCode::Down => review.stream.move_cursor(1),
+                KeyCode::Char('k') | KeyCode::Up => review.stream.move_cursor(-1),
+                KeyCode::PageDown => review.stream.move_cursor(20),
+                KeyCode::PageUp => review.stream.move_cursor(-20),
+                KeyCode::Char('y') => self.copy_selection(false),
+                KeyCode::Char('Y') => self.copy_selection(true),
+                _ => {}
+            }
+            return;
+        }
         match code {
             // Esc peels back one layer at a time: live search → tree pick → picker.
             KeyCode::Esc if review.stream.has_search() => review.stream.clear_search(),
@@ -540,6 +567,9 @@ impl App {
             }
             KeyCode::Char('q') | KeyCode::Esc | KeyCode::Char('x') => self.open_picker(),
             KeyCode::Char('/') => self.search_input = Some(String::new()),
+            KeyCode::Char('v') if review.focus == Focus::Stream => {
+                review.stream.start_selection();
+            }
             KeyCode::Char('n') if review.stream.has_search() => {
                 review.stream.next_match();
                 sync_tree(review);
@@ -630,6 +660,29 @@ impl App {
     }
 
     // ---- transitions ------------------------------------------------------
+
+    fn copy_selection(&mut self, patch_style: bool) {
+        let Screen::Review(review) = &mut self.screen else {
+            return;
+        };
+        let Some(text) = review.stream.selected_text(&review.diff.files, patch_style) else {
+            self.error = Some("selection has no copyable lines".into());
+            return;
+        };
+        let lines = text.lines().count();
+        match arboard::Clipboard::new().and_then(|mut c| c.set_text(text)) {
+            Ok(()) => {
+                let style = if patch_style { "as patch" } else { "as code" };
+                self.notice = Some(format!(
+                    "copied {} line{} {style}",
+                    lines,
+                    if lines == 1 { "" } else { "s" }
+                ));
+                review.stream.cancel_selection();
+            }
+            Err(e) => self.error = Some(format!("clipboard: {e}")),
+        }
+    }
 
     fn open_scope(&mut self, scope: Scope) {
         self.seq += 1; // invalidate any in-flight reload

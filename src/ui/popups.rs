@@ -10,6 +10,7 @@ const HELP: &[(&str, &str)] = &[
     ("n / p", "next / previous hunk"),
     ("/", "search the diff"),
     ("n / N", "next / previous match while a search is live"),
+    ("v", "select lines; then y copies code, Y copies a patch"),
     ("Tab", "pick a file from the tree (Esc cancels)"),
     ("⏎", "open the selected file / entry"),
     ("t", "show / hide the file tree"),

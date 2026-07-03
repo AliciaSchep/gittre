@@ -163,14 +163,18 @@ expand" row.
      copies clean code (new side, no signs), `Y` copies patch-style with
      signs; clipboard via `arboard`. The cursor/selection machinery is shared
      groundwork for M5 commenting.
-  4. **Full-file view**: `o` opens an internal read-only pager at the current
-     line — reads the git blob for historical scopes, disk for worktree
-     scopes; `q`/`Esc` back.
+  4. **Full-file view**, both flavors: `o` opens an internal read-only pager
+     at the current line (reads the git blob for historical scopes, disk for
+     worktree scopes; `q`/`Esc` back); `E` suspends the TUI and opens
+     `$EDITOR` at file:line (disk content — exact for worktree scopes, best
+     effort for historical ones).
   5. **Commit ranges**: Space in the log picker marks a base, Enter picks the
      tip → review `base..tip`; CLI `gittre a..b`.
   6. **Syntax highlighting** (`syntect`, per-visible-line, cached,
      independent per-line like delta; add/remove stays as bg tint).
-  7. **Side-by-side view** (`s` toggle, auto-fallback when narrow).
+
+  Deferred to a later phase: **side-by-side view** (`s` toggle, auto-fallback
+  when narrow).
 - **M5 — commenting** (design TBD, see §7). Line/range comments, persistence,
   markdown export. Builds on the M4 cursor/selection.
 

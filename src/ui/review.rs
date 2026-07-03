@@ -22,6 +22,18 @@ struct SearchState {
     current: usize,
 }
 
+/// A row-range selection made in select mode (`v`).
+struct Selection {
+    anchor: usize,
+    cursor: usize,
+}
+
+impl Selection {
+    fn range(&self) -> (usize, usize) {
+        (self.anchor.min(self.cursor), self.anchor.max(self.cursor))
+    }
+}
+
 /// The continuous multi-file diff view.
 pub struct Stream {
     rows: Vec<Row>,
@@ -33,6 +45,7 @@ pub struct Stream {
     /// Height of the last rendered viewport, for paging and clamping.
     viewport: Cell<usize>,
     search: Option<SearchState>,
+    selection: Option<Selection>,
 }
 
 impl Stream {
@@ -67,7 +80,86 @@ impl Stream {
             scroll: 0,
             viewport: Cell::new(24),
             search: None,
+            selection: None,
         }
+    }
+
+    // ---- selection ---------------------------------------------------------
+
+    /// Enter select mode with the cursor on the top visible row.
+    pub fn start_selection(&mut self) {
+        if self.rows.is_empty() {
+            return;
+        }
+        let start = self.scroll.min(self.rows.len() - 1);
+        self.selection = Some(Selection {
+            anchor: start,
+            cursor: start,
+        });
+    }
+
+    pub fn cancel_selection(&mut self) {
+        self.selection = None;
+    }
+
+    pub fn has_selection(&self) -> bool {
+        self.selection.is_some()
+    }
+
+    /// Move the selection cursor and keep it in view.
+    pub fn move_cursor(&mut self, delta: isize) {
+        let len = self.rows.len();
+        let Some(sel) = &mut self.selection else {
+            return;
+        };
+        let cursor =
+            (sel.cursor as isize + delta).clamp(0, len.saturating_sub(1) as isize) as usize;
+        sel.cursor = cursor;
+        let viewport = self.viewport.get().max(1);
+        if cursor < self.scroll {
+            self.scroll = cursor;
+        } else if cursor >= self.scroll + viewport {
+            self.scroll = cursor + 1 - viewport;
+        }
+    }
+
+    /// Selected rows count (for the "copied N lines" notice).
+    pub fn selection_len(&self) -> usize {
+        self.selection
+            .as_ref()
+            .map(|s| {
+                let (lo, hi) = s.range();
+                hi - lo + 1
+            })
+            .unwrap_or(0)
+    }
+
+    /// Text of the selection. `patch_style` keeps +/- signs and hunk headers;
+    /// otherwise returns clean new-side code (deletions skipped).
+    pub fn selected_text(&self, files: &[FileDiff], patch_style: bool) -> Option<String> {
+        let (lo, hi) = self.selection.as_ref()?.range();
+        let mut out = String::new();
+        for row in &self.rows[lo..=hi.min(self.rows.len() - 1)] {
+            match *row {
+                Row::Line(fi, hi_, li) => {
+                    let line = &files[fi].hunks[hi_].lines[li];
+                    if patch_style {
+                        out.push(line.origin);
+                        out.push_str(&line.content);
+                        out.push('\n');
+                    } else if line.origin != '-' {
+                        out.push_str(&line.content);
+                        out.push('\n');
+                    }
+                }
+                Row::HunkHeader(fi, hi_) if patch_style => {
+                    out.push_str(&files[fi].hunks[hi_].header);
+                    out.push('\n');
+                }
+                _ => {}
+            }
+        }
+        (!out.is_empty()).then_some(out)
     }
 
     // ---- search ------------------------------------------------------------
@@ -270,9 +362,22 @@ impl Stream {
         let visible = self
             .rows
             .iter()
+            .enumerate()
             .skip(self.scroll)
             .take(inner.height as usize)
-            .map(|row| self.render_row(row, files, inner.width))
+            .map(|(idx, row)| {
+                let mut line = self.render_row(row, files, inner.width);
+                if let Some(sel) = &self.selection {
+                    let (lo, hi) = sel.range();
+                    if idx >= lo && idx <= hi {
+                        line = line.on_dark_gray();
+                    }
+                    if idx == sel.cursor {
+                        line = line.bold().underlined();
+                    }
+                }
+                line
+            })
             .collect::<Vec<_>>();
         frame.render_widget(Paragraph::new(visible), inner);
     }
