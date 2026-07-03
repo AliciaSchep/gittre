@@ -17,6 +17,10 @@ const HELP: &[(&str, &str)] = &[
     ("?", "toggle this help"),
     ("q / Esc", "back; quits from the picker"),
     ("⌃c", "quit from anywhere"),
+    (
+        "mouse",
+        "wheel scrolls; click picks (shift+drag to select text)",
+    ),
 ];
 
 pub fn render_help(frame: &mut Frame, area: Rect) {

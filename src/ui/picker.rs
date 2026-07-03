@@ -1,3 +1,5 @@
+use std::cell::Cell;
+
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, BorderType, List, ListItem, ListState};
 
@@ -23,9 +25,28 @@ pub struct ScopeItem {
 pub struct ScopePicker {
     pub items: Vec<ScopeItem>,
     pub selected: usize,
+    last_inner: Cell<Rect>,
 }
 
 impl ScopePicker {
+    pub fn new(items: Vec<ScopeItem>) -> Self {
+        ScopePicker {
+            items,
+            selected: 0,
+            last_inner: Cell::new(Rect::default()),
+        }
+    }
+
+    /// Screen position -> item index (the menu never scrolls).
+    pub fn hit(&self, column: u16, row: u16) -> Option<usize> {
+        let inner = self.last_inner.get();
+        if !inner.contains(Position::new(column, row)) {
+            return None;
+        }
+        let idx = (row - inner.y) as usize;
+        (idx < self.items.len()).then_some(idx)
+    }
+
     pub fn move_selection(&mut self, delta: isize) {
         let len = self.items.len() as isize;
         if len > 0 {
@@ -62,12 +83,12 @@ impl ScopePicker {
             })
             .collect();
 
+        let block = Block::bordered()
+            .border_type(BorderType::Rounded)
+            .title(Line::from(" review what? ".bold()));
+        self.last_inner.set(block.inner(popup));
         let list = List::new(items)
-            .block(
-                Block::bordered()
-                    .border_type(BorderType::Rounded)
-                    .title(Line::from(" review what? ".bold())),
-            )
+            .block(block)
             .highlight_style(Style::new().reversed());
         let mut state = ListState::default().with_selected(Some(self.selected));
         frame.render_stateful_widget(list, popup, &mut state);
@@ -78,9 +99,24 @@ impl ScopePicker {
 pub struct BasePicker {
     pub names: Vec<String>,
     pub selected: usize,
+    pub state: ListState,
+    last_inner: Cell<Rect>,
 }
 
 impl BasePicker {
+    pub fn new(names: Vec<String>) -> Self {
+        BasePicker {
+            names,
+            selected: 0,
+            state: ListState::default(),
+            last_inner: Cell::new(Rect::default()),
+        }
+    }
+
+    pub fn hit(&self, column: u16, row: u16) -> Option<usize> {
+        list_hit(&self.last_inner, &self.state, self.names.len(), column, row)
+    }
+
     pub fn move_selection(&mut self, delta: isize) {
         let len = self.names.len() as isize;
         if len > 0 {
@@ -88,17 +124,19 @@ impl BasePicker {
         }
     }
 
-    pub fn render(&self, frame: &mut Frame, area: Rect) {
+    pub fn render(&mut self, frame: &mut Frame, area: Rect) {
         let items: Vec<ListItem> = self
             .names
             .iter()
             .map(|name| ListItem::new(Line::from(format!(" {name}"))))
             .collect();
+        let block = Block::new().title(Line::from(" pick a base to compare against ".bold()));
+        self.last_inner.set(block.inner(area));
         let list = List::new(items)
-            .block(Block::new().title(Line::from(" pick a base to compare against ".bold())))
+            .block(block)
             .highlight_style(Style::new().reversed());
-        let mut state = ListState::default().with_selected(Some(self.selected));
-        frame.render_stateful_widget(list, area, &mut state);
+        self.state.select(Some(self.selected));
+        frame.render_stateful_widget(list, area, &mut self.state);
     }
 }
 
@@ -106,9 +144,30 @@ impl BasePicker {
 pub struct LogPicker {
     pub entries: Vec<LogEntry>,
     pub selected: usize,
+    pub state: ListState,
+    last_inner: Cell<Rect>,
 }
 
 impl LogPicker {
+    pub fn new(entries: Vec<LogEntry>) -> Self {
+        LogPicker {
+            entries,
+            selected: 0,
+            state: ListState::default(),
+            last_inner: Cell::new(Rect::default()),
+        }
+    }
+
+    pub fn hit(&self, column: u16, row: u16) -> Option<usize> {
+        list_hit(
+            &self.last_inner,
+            &self.state,
+            self.entries.len(),
+            column,
+            row,
+        )
+    }
+
     pub fn move_selection(&mut self, delta: isize) {
         let len = self.entries.len() as isize;
         if len > 0 {
@@ -116,7 +175,7 @@ impl LogPicker {
         }
     }
 
-    pub fn render(&self, frame: &mut Frame, area: Rect) {
+    pub fn render(&mut self, frame: &mut Frame, area: Rect) {
         let items: Vec<ListItem> = self
             .entries
             .iter()
@@ -130,10 +189,27 @@ impl LogPicker {
             })
             .collect();
 
+        let block = Block::new().title(Line::from(" pick a commit ".bold()));
+        self.last_inner.set(block.inner(area));
         let list = List::new(items)
-            .block(Block::new().title(Line::from(" pick a commit ".bold())))
+            .block(block)
             .highlight_style(Style::new().reversed());
-        let mut state = ListState::default().with_selected(Some(self.selected));
-        frame.render_stateful_widget(list, area, &mut state);
+        self.state.select(Some(self.selected));
+        frame.render_stateful_widget(list, area, &mut self.state);
     }
+}
+
+fn list_hit(
+    last_inner: &Cell<Rect>,
+    state: &ListState,
+    len: usize,
+    column: u16,
+    row: u16,
+) -> Option<usize> {
+    let inner = last_inner.get();
+    if !inner.contains(Position::new(column, row)) {
+        return None;
+    }
+    let idx = state.offset() + (row - inner.y) as usize;
+    (idx < len).then_some(idx)
 }

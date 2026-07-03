@@ -1,3 +1,5 @@
+use std::cell::Cell;
+
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState};
 
@@ -17,6 +19,10 @@ pub struct FileTree {
     root: Node,
     /// Selection index into the currently visible (flattened) rows.
     pub selected: usize,
+    /// List scroll state, persisted so mouse clicks can be hit-tested.
+    state: ListState,
+    /// Inner list rect from the last render, for mouse hit-testing.
+    last_inner: Cell<Rect>,
 }
 
 /// One visible row after flattening: (depth, node path through the tree).
@@ -60,7 +66,22 @@ impl FileTree {
             }
         }
         sort_children(&mut root);
-        FileTree { root, selected: 0 }
+        FileTree {
+            root,
+            selected: 0,
+            state: ListState::default(),
+            last_inner: Cell::new(Rect::default()),
+        }
+    }
+
+    /// Map a screen position to a visible row index, if it hits the list.
+    pub fn hit(&self, column: u16, row: u16) -> Option<usize> {
+        let inner = self.last_inner.get();
+        if !inner.contains(Position::new(column, row)) {
+            return None;
+        }
+        let idx = self.state.offset() + (row - inner.y) as usize;
+        (idx < self.len()).then_some(idx)
     }
 
     fn visible(&self) -> Vec<VisibleRow<'_>> {
@@ -175,7 +196,7 @@ impl FileTree {
         paths.get(self.selected).cloned()
     }
 
-    pub fn render(&self, frame: &mut Frame, area: Rect, focused: bool) {
+    pub fn render(&mut self, frame: &mut Frame, area: Rect, focused: bool) {
         let (border_style, title) = if focused {
             (
                 Style::new().cyan(),
@@ -220,9 +241,10 @@ impl FileTree {
         } else {
             Style::new().on_dark_gray()
         };
+        self.last_inner.set(block.inner(area));
         let list = List::new(items).block(block).highlight_style(highlight);
-        let mut state = ListState::default().with_selected(Some(self.selected));
-        frame.render_stateful_widget(list, area, &mut state);
+        self.state.select(Some(self.selected));
+        frame.render_stateful_widget(list, area, &mut self.state);
     }
 }
 

@@ -4,7 +4,9 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use git2::Repository;
 use ratatui::DefaultTerminal;
-use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use ratatui::crossterm::event::{
+    self, Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use ratatui::prelude::*;
 use ratatui::widgets::Paragraph;
 
@@ -106,10 +108,12 @@ impl App {
         while !self.quit {
             terminal.draw(|frame| self.draw(frame))?;
             if event::poll(Duration::from_millis(100))? {
-                if let Event::Key(key) = event::read()? {
-                    if key.kind == KeyEventKind::Press {
+                match event::read()? {
+                    Event::Key(key) if key.kind == KeyEventKind::Press => {
                         self.on_key(key.code, key.modifiers);
                     }
+                    Event::Mouse(mouse) => self.on_mouse(mouse),
+                    _ => {}
                 }
             }
             while let Ok(app_event) = self.events.try_recv() {
@@ -117,6 +121,79 @@ impl App {
             }
         }
         Ok(())
+    }
+
+    fn on_mouse(&mut self, mouse: MouseEvent) {
+        let (col, row) = (mouse.column, mouse.row);
+        match mouse.kind {
+            MouseEventKind::ScrollDown => self.mouse_scroll(1, col, row),
+            MouseEventKind::ScrollUp => self.mouse_scroll(-1, col, row),
+            MouseEventKind::Down(MouseButton::Left) => self.mouse_click(col, row),
+            _ => {}
+        }
+    }
+
+    fn mouse_scroll(&mut self, direction: isize, col: u16, row: u16) {
+        match &mut self.screen {
+            Screen::Review(review) => {
+                // Wheel over an *active* tree moves its selection; everywhere
+                // else it scrolls the diff (the tree is passive by default).
+                if review.focus == Focus::Tree && review.tree.hit(col, row).is_some() {
+                    review.tree.move_selection(direction);
+                } else {
+                    review.stream.scroll_by(direction * 3);
+                    sync_tree(review);
+                }
+            }
+            Screen::Picker(picker) => picker.move_selection(direction),
+            Screen::Log(log) => log.move_selection(direction),
+            Screen::Base(base) => base.move_selection(direction),
+        }
+    }
+
+    fn mouse_click(&mut self, col: u16, row: u16) {
+        if self.show_help {
+            self.show_help = false;
+            return;
+        }
+        match &mut self.screen {
+            Screen::Review(review) => {
+                if let Some(idx) = review.tree.hit(col, row) {
+                    review.tree.selected = idx;
+                    if let Some(file_idx) = review.tree.activate() {
+                        review.stream.jump_to_file(file_idx);
+                        review.focus = Focus::Stream;
+                    }
+                }
+            }
+            // The scope picker is a menu: click opens directly.
+            Screen::Picker(picker) => {
+                if let Some(idx) = picker.hit(col, row) {
+                    picker.selected = idx;
+                    self.activate_picker_item();
+                }
+            }
+            // Long lists: first click selects, a second click on the
+            // selected row opens.
+            Screen::Log(log) => {
+                if let Some(idx) = log.hit(col, row) {
+                    if log.selected == idx {
+                        self.open_selected_commit();
+                    } else {
+                        log.selected = idx;
+                    }
+                }
+            }
+            Screen::Base(base) => {
+                if let Some(idx) = base.hit(col, row) {
+                    if base.selected == idx {
+                        self.open_selected_base();
+                    } else {
+                        base.selected = idx;
+                    }
+                }
+            }
+        }
     }
 
     fn on_app_event(&mut self, event: AppEvent) {
@@ -377,10 +454,7 @@ impl App {
                     self.error = Some("no commits yet".into());
                 }
                 Ok(entries) => {
-                    self.screen = Screen::Log(LogPicker {
-                        entries,
-                        selected: 0,
-                    });
+                    self.screen = Screen::Log(LogPicker::new(entries));
                 }
                 Err(e) => self.error = Some(format!("{e:#}")),
             },
@@ -390,7 +464,7 @@ impl App {
                     self.error =
                         Some("only one branch and no upstream — nothing to compare".into());
                 } else {
-                    self.screen = Screen::Base(BasePicker { names, selected: 0 });
+                    self.screen = Screen::Base(BasePicker::new(names));
                 }
             }
         }
@@ -408,13 +482,18 @@ impl App {
             KeyCode::PageUp => base.move_selection(-20),
             KeyCode::Char('g') | KeyCode::Home => base.selected = 0,
             KeyCode::Char('G') | KeyCode::End => base.selected = base.names.len().saturating_sub(1),
-            KeyCode::Enter => {
-                if let Some(name) = base.names.get(base.selected) {
-                    let scope = Scope::Branch { base: name.clone() };
-                    self.open_scope(scope);
-                }
-            }
+            KeyCode::Enter => self.open_selected_base(),
             _ => {}
+        }
+    }
+
+    fn open_selected_base(&mut self) {
+        let Screen::Base(base) = &self.screen else {
+            return;
+        };
+        if let Some(name) = base.names.get(base.selected) {
+            let scope = Scope::Branch { base: name.clone() };
+            self.open_scope(scope);
         }
     }
 
@@ -430,16 +509,21 @@ impl App {
             KeyCode::PageUp => log.move_selection(-20),
             KeyCode::Char('g') | KeyCode::Home => log.selected = 0,
             KeyCode::Char('G') | KeyCode::End => log.selected = log.entries.len().saturating_sub(1),
-            KeyCode::Enter => {
-                if let Some(entry) = log.entries.get(log.selected) {
-                    let scope = Scope::Commit {
-                        id: entry.id,
-                        summary: entry.summary.clone(),
-                    };
-                    self.open_scope(scope);
-                }
-            }
+            KeyCode::Enter => self.open_selected_commit(),
             _ => {}
+        }
+    }
+
+    fn open_selected_commit(&mut self) {
+        let Screen::Log(log) = &self.screen else {
+            return;
+        };
+        if let Some(entry) = log.entries.get(log.selected) {
+            let scope = Scope::Commit {
+                id: entry.id,
+                summary: entry.summary.clone(),
+            };
+            self.open_scope(scope);
         }
     }
 
@@ -603,10 +687,10 @@ fn build_picker(repo: &Repository) -> ScopePicker {
         detail: String::new(),
         action: ScopeAction::PickCommit,
     });
-    ScopePicker { items, selected: 0 }
+    ScopePicker::new(items)
 }
 
-fn draw_review(review: &ReviewState, frame: &mut Frame, area: Rect) {
+fn draw_review(review: &mut ReviewState, frame: &mut Frame, area: Rect) {
     if review.diff.files.is_empty() {
         let msg = Paragraph::new(Line::from(
             format!("✔ {}", review.scope.empty_message()).green(),
