@@ -1,0 +1,102 @@
+# Agent guide
+
+gittre is a review-only git TUI (Rust). Read [README.md](README.md) for what
+it does; read [PLAN.md](PLAN.md) for design decisions, their rationale, and
+milestone status — **keep PLAN.md current when you change direction**.
+
+## Hard constraints
+
+- **Review-only, forever.** No committing, staging, merging, stashing,
+  pushing, or file editing (the `$EDITOR` handoff is the sanctioned escape
+  hatch). Reject features that mutate the repo.
+- **The command bar teaches the UI.** Any new mode or keybinding must show up
+  in the contextual hints (`App::hints`) and the `?` help popup
+  (`src/ui/popups.rs`), or it doesn't exist.
+- **No emoji in the UI.** Cell width is unreliable across terminals (and
+  crashes pyte). Use single-width glyphs: ✎ ▐ ⚠ ● ▏.
+
+## Map
+
+```
+src/main.rs        clap CLI (flags, a..b ranges, export subcommand), terminal
+                   setup, mouse-capture panic hook
+src/app.rs         the App state machine: Screen{Picker,Log,Base,Review} +
+                   input modes (search/export/comment-draft/confirm) + all
+                   key routing. Biggest file; most changes end up here.
+src/event.rs       AppEvent channel + background diff-loader thread
+src/watch.rs       notify watcher -> debounced RepoChanged (worktree-aware,
+                   git-ignore filtered)
+src/comments.rs    comment model, JSON store (<gitdir>/gittre/), re-anchoring
+                   cascade (exact -> moved -> outdated), markdown export
+src/git/scope.rs   Scope enum, diff building per scope, base detection,
+                   full-file content per scope
+src/git/diff.rs    git2 diff -> DiffResult (tree-order sorted; tested here)
+src/git/log.rs     commit list for the picker
+src/ui/review.rs   the diff Stream: rows, cursor, selection, search, comment
+                   blocks, syntax cache. Second-biggest; owns all position
+                   logic.
+src/ui/tree.rs     changed-files sidebar (jump-menu model, passive marker)
+src/ui/{picker,fileview,bar,popups,highlight}.rs
+```
+
+## Load-bearing invariants
+
+- **Everything positional keys off `Stream.cursor`** (not scroll): `c`, `o`,
+  `E`, `d`, tree sync, sticky title. If you add a position-dependent feature,
+  read the cursor.
+- **Stream rows are rebuilt wholesale** (reload, comment change); position is
+  preserved via `Stream::anchor()/restore()` (file path + offset + screen
+  offset). Never hold row indices across a rebuild.
+- **Tree order == stream order** (`tree_order` in git/diff.rs, tested). The
+  sidebar and the stream must always traverse files identically.
+- **Comments anchor to content, not positions.** The snippet is the source of
+  truth for re-anchoring; "outdated" is a display state, never data loss.
+  `CommentStore` persists on every mutation (atomic tmp+rename).
+- **git2 handles don't cross threads**: the loader thread opens its own
+  `Repository`. A `seq` counter drops stale loader responses.
+- **Worktrees:** never assume `<workdir>/.git` is a directory. Use
+  `repo.path()` (per-worktree gitdir) and `repo.commondir()` (shared refs) —
+  the watcher and comment store depend on this.
+
+## Verify at the surface, not just with tests
+
+`cargo test` covers the git/comments layers, but every feature here was
+verified by driving the real TUI in a pty and reading screen snapshots:
+
+```sh
+uv run --with pyte dev/tui_drive.py scenario.json
+```
+
+Scenario format is documented in the script's docstring: keystrokes
+(`<ESC>`, `<C-c>` tokens), atomic `send_raw` for SGR mouse escapes, `shell`
+steps to mutate the repo mid-run (this is how auto-reload and comment
+re-anchoring were tested), resizes, `env`, and `rawlog` for asserting
+truecolor bytes. Build throwaway repos in a temp dir for scenarios; snapshot
+before/after each interaction and read the dumps.
+
+pyte limits to know: no alternate-screen buffer (the `$EDITOR` suspend/resume
+flow leaves ghost rows in dumps — not a real bug), no styling in text dumps,
+chokes on some emoji.
+
+Before committing: `cargo fmt && cargo clippy --all-targets && cargo test`
+— all three have stayed clean at every commit.
+
+## Ecosystem gotchas (cost real time)
+
+- **git2 0.21** returns `Result` where older versions returned values:
+  `commit.summary()` is `Result<Option<&str>>`, `reference.shorthand()` /
+  `signature.name()` are `Result<&str>`.
+- **ratatui 0.30**: use the `ratatui::crossterm` re-export everywhere;
+  `crossterm` is not a direct dependency.
+- **Raw mode swallows Ctrl-C** — it's handled as a key event in
+  `App::on_key`; don't remove it.
+- **syntect startup is slow in debug builds** (~1s blank first frame);
+  release is 0.02s. Don't chase it as a perf bug.
+- Watch for **key collisions with modifier guards**: match arms like
+  `Char('d')` must exclude CONTROL or they shadow Ctrl-d paging (clippy's
+  unreachable-pattern warning catches this — heed it).
+
+## Deferred by explicit decision (don't re-litigate, ask first)
+
+Side-by-side view; comment resolve/done state. Both are in PLAN.md with
+context.
