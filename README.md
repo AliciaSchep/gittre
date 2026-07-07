@@ -42,7 +42,8 @@ right now:
 The review screen is one scrollable stream of every changed file, with a file
 tree alongside (`Tab` to jump via the tree, `t` to hide it). The view
 **reloads automatically** when files change, you commit, or switch branches —
-your reading position survives.
+your reading position survives. In very large repositories, `--no-watch`
+disables that and `r` reloads on demand.
 
 CLI shortcuts: `gittre -u` (uncommitted) · `-s` (staged) · `-b [base]`
 (branch vs merge-base) · `gittre <rev>` · `gittre a..b` · `-C <path>`.

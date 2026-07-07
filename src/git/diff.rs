@@ -195,7 +195,7 @@ fn tree_order(a: &str, b: &str) -> std::cmp::Ordering {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::git::scope::{Scope, commit_scope, detect_base, file_count};
+    use crate::git::scope::{Scope, commit_scope, detect_base, file_count_fast};
     use std::fs;
     use std::path::Path;
 
@@ -395,7 +395,7 @@ mod tests {
         let (dir, repo) = setup();
         fs::write(dir.path().join("a.txt"), "changed\n").unwrap();
         fs::write(dir.path().join("new.txt"), "hello\n").unwrap();
-        assert_eq!(file_count(&repo, &Scope::Uncommitted), 2);
-        assert_eq!(file_count(&repo, &Scope::Staged), 0);
+        assert_eq!(file_count_fast(&repo, &Scope::Uncommitted), 2);
+        assert_eq!(file_count_fast(&repo, &Scope::Staged), 0);
     }
 }

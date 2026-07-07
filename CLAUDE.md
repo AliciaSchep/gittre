@@ -54,6 +54,13 @@ src/ui/{picker,fileview,bar,popups,highlight}.rs
   `CommentStore` persists on every mutation (atomic tmp+rename).
 - **git2 handles don't cross threads**: the loader thread opens its own
   `Repository`. A `seq` counter drops stale loader responses.
+- **The UI thread never computes a diff.** All git-expensive work (scope
+  loads, reloads, picker counts) goes through the loader thread; the picker
+  renders instantly with "…" counts that fill in. Keep it that way — a
+  synchronous diff on the UI thread is exactly what made large repos hang.
+- Rename detection is skipped above `RENAME_DETECTION_LIMIT` changed files;
+  `--no-watch` + `r` is the escape hatch for repos where reloads are costly
+  (a one-time hint suggests it when a reload exceeds 1s).
 - **Worktrees:** never assume `<workdir>/.git` is a directory. Use
   `repo.path()` (per-worktree gitdir) and `repo.commondir()` (shared refs) —
   the watcher and comment store depend on this.
@@ -77,6 +84,14 @@ before/after each interaction and read the dumps.
 pyte limits to know: no alternate-screen buffer (the `$EDITOR` suspend/resume
 flow leaves ghost rows in dumps — not a real bug), no styling in text dumps,
 chokes on some emoji.
+
+Debugging the live TUI: set `GITTRE_LOG=/tmp/gittre.log` — event traffic
+(reloads, loads with timings) appends there, since the TUI owns the terminal.
+
+A lesson the harness already encodes: kernel pty buffers are ~16KB, so the
+driver drains the pty on a dedicated thread. If a TUI under test ever seems
+to freeze for seconds per frame, suspect the *harness* not draining before
+suspecting the app.
 
 Before committing: `cargo fmt && cargo clippy --all-targets && cargo test`
 — all three have stayed clean at every commit.

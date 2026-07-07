@@ -20,6 +20,10 @@ const HELP: &[(&str, &str)] = &[
     ("Tab", "pick a file from the tree (Esc cancels)"),
     ("⏎", "open the selected file / entry"),
     ("t", "show / hide the file tree"),
+    (
+        "r",
+        "reload the diff now (always available; see --no-watch)",
+    ),
     ("x", "switch scope (back to the picker)"),
     ("?", "toggle this help"),
     ("q / Esc", "back; quits from the picker"),

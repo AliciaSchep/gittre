@@ -28,7 +28,31 @@ pub struct ScopePicker {
     last_inner: Cell<Rect>,
 }
 
+pub fn count_label(n: usize) -> String {
+    if n == 1 {
+        "1 file".into()
+    } else {
+        format!("{n} files")
+    }
+}
+
 impl ScopePicker {
+    /// Fill in asynchronously computed file counts.
+    pub fn set_counts(&mut self, uncommitted: usize, staged: usize, branch: Option<usize>) {
+        for item in &mut self.items {
+            match &item.action {
+                ScopeAction::Open(Scope::Uncommitted) => item.detail = count_label(uncommitted),
+                ScopeAction::Open(Scope::Staged) => item.detail = count_label(staged),
+                ScopeAction::Open(Scope::Branch { .. }) => {
+                    if let Some(n) = branch {
+                        item.detail = count_label(n);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
     pub fn new(items: Vec<ScopeItem>) -> Self {
         ScopePicker {
             items,

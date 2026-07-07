@@ -37,6 +37,11 @@ struct Args {
     /// Repository path (defaults to the current directory)
     #[arg(short = 'C', long = "repo", default_value = ".", value_name = "PATH")]
     repo: std::path::PathBuf,
+
+    /// Disable auto-reload on repo changes (press r to reload manually).
+    /// Useful in very large repositories.
+    #[arg(long)]
+    no_watch: bool,
 }
 
 impl Args {
@@ -112,15 +117,10 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    // Resolve and load any CLI-selected scope before entering raw mode, so
-    // errors print as plain text instead of garbling the terminal.
-    let initial = match args.initial_scope(&repo)? {
-        Some(scope) => {
-            let diff = git::diff::load(&repo, &scope)?;
-            Some((scope, diff))
-        }
-        None => None,
-    };
+    // Resolve (and validate) any CLI-selected scope before entering raw
+    // mode, so errors print as plain text; the diff itself loads in the
+    // background once the TUI is up.
+    let initial = args.initial_scope(&repo)?;
 
     let mut terminal = ratatui::init();
     let _ = ratatui::crossterm::execute!(
@@ -137,7 +137,7 @@ fn main() -> Result<()> {
         );
         prev_hook(info);
     }));
-    let result = app::App::new(repo, initial).run(&mut terminal);
+    let result = app::App::new(repo, initial, !args.no_watch).run(&mut terminal);
     let _ = ratatui::crossterm::execute!(
         std::io::stdout(),
         ratatui::crossterm::event::DisableMouseCapture

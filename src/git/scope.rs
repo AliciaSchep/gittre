@@ -152,13 +152,36 @@ pub fn build_diff<'r>(repo: &'r Repository, scope: &Scope) -> Result<git2::Diff<
         }
     };
 
-    diff.find_similar(None).ok();
+    // Rename detection reads file contents pairwise; on huge diffs it can
+    // dominate load time, so skip it past a threshold (statuses still show
+    // as delete+add, which is honest if less pretty).
+    if diff.deltas().len() <= RENAME_DETECTION_LIMIT {
+        diff.find_similar(None).ok();
+    }
     Ok(diff)
 }
 
-/// Number of changed files in a scope, without walking file contents.
-pub fn file_count(repo: &Repository, scope: &Scope) -> usize {
-    build_diff(repo, scope).map_or(0, |d| d.deltas().len())
+/// Above this many changed files, skip rename detection.
+const RENAME_DETECTION_LIMIT: usize = 2000;
+
+/// Number of changed files in a scope, built as cheaply as possible: no
+/// untracked contents, no rename detection. Counts only — never reuse for
+/// display.
+pub fn file_count_fast(repo: &Repository, scope: &Scope) -> usize {
+    let mut opts = DiffOptions::new();
+    opts.include_typechange(true);
+    let diff = match scope {
+        Scope::Uncommitted => {
+            opts.include_untracked(true).recurse_untracked_dirs(true);
+            let Ok(head_tree) = head_tree(repo) else {
+                return 0;
+            };
+            repo.diff_tree_to_workdir_with_index(head_tree.as_ref(), Some(&mut opts))
+        }
+        // The other scopes are cheap to build; reuse the real construction.
+        _ => return build_diff(repo, scope).map_or(0, |d| d.deltas().len()),
+    };
+    diff.map_or(0, |d| d.deltas().len())
 }
 
 /// Resolve `a..b` / `a...b` (git-diff semantics: `...` diffs from the

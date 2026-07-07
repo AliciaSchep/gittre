@@ -39,12 +39,12 @@ import fcntl
 import json
 import os
 import pty
-import select
 import signal
 import struct
 import subprocess
 import sys
 import termios
+import threading
 import time
 
 import pyte
@@ -52,12 +52,14 @@ import pyte
 
 RAWLOG = None
 
+# The pty must be drained CONTINUOUSLY: kernel pty buffers are small (~16KB)
+# and a TUI writing a large frame blocks until someone reads. A reader thread
+# feeds the emulator; snapshots take the lock.
+SCREEN_LOCK = threading.Lock()
 
-def drain(master, stream, timeout=0.05):
-    while True:
-        r, _, _ = select.select([master], [], [], timeout)
-        if not r:
-            return
+
+def reader_thread(master, stream, done):
+    while not done.is_set():
         try:
             data = os.read(master, 65536)
         except OSError:
@@ -66,7 +68,8 @@ def drain(master, stream, timeout=0.05):
             return
         if RAWLOG:
             RAWLOG.write(data)
-        stream.feed(data)
+        with SCREEN_LOCK:
+            stream.feed(data)
 
 
 def set_winsize(fd, cols, rows):
@@ -101,8 +104,11 @@ def main():
     )
     os.close(slave)
 
+    done = threading.Event()
+    reader = threading.Thread(target=reader_thread, args=(master, stream, done), daemon=True)
+    reader.start()
+
     time.sleep(scenario.get("startup_wait", 1.0))
-    drain(master, stream)
 
     for step in scenario["steps"]:
         if "shell" in step:
@@ -120,13 +126,13 @@ def main():
                 os.write(master, ch.encode())
                 time.sleep(0.02)
         time.sleep(step.get("wait", 0.3))
-        drain(master, stream)
         if step.get("snap"):
+            with SCREEN_LOCK:
+                dump = "\n".join(screen.display)
             with open(os.path.join(outdir, step["snap"] + ".txt"), "w") as f:
-                f.write("\n".join(screen.display))
+                f.write(dump)
 
     time.sleep(0.3)
-    drain(master, stream)
     exited = proc.poll()
     if exited is None:
         proc.kill()
@@ -134,6 +140,7 @@ def main():
         print("RESULT: process still running at end (killed)")
     else:
         print(f"RESULT: exit code {exited}")
+    done.set()
     os.close(master)
 
 

@@ -11,13 +11,13 @@ use ratatui::prelude::*;
 use ratatui::widgets::Paragraph;
 
 use crate::comments::{CommentStore, export_markdown};
-use crate::event::{AppEvent, LoadRequest, spawn_loader};
-use crate::git::diff::{self, DiffResult};
+use crate::event::{AppEvent, LoadRequest, ScopeCounts, spawn_loader};
+use crate::git::diff::DiffResult;
 use crate::git::log::commit_log;
-use crate::git::scope::{Scope, base_candidates, detect_base, file_content, file_count};
+use crate::git::scope::{Scope, base_candidates, detect_base, file_content};
 use crate::ui::fileview::FileView;
 use crate::ui::highlight::Highlighter;
-use crate::ui::picker::{BasePicker, LogPicker, ScopeAction, ScopeItem, ScopePicker};
+use crate::ui::picker::{BasePicker, LogPicker, ScopeAction, ScopeItem, ScopePicker, count_label};
 use crate::ui::review::{CommentTarget, Stream};
 use crate::ui::tree::FileTree;
 use crate::ui::{bar, popups};
@@ -92,6 +92,8 @@ pub struct App {
     comment_draft: Option<CommentDraft>,
     /// `D` pressed: waiting for y/n to delete every comment.
     confirm_clear: bool,
+    /// The "reloads are slow, try --no-watch" hint fires at most once.
+    slow_hint_shown: bool,
 }
 
 struct CommentDraft {
@@ -105,22 +107,40 @@ struct CommentDraft {
 
 const TREE_WIDTH: u16 = 32;
 
+/// Append a line to $GITTRE_LOG if set — the TUI owns the terminal, so
+/// debugging goes to a file.
+pub fn debug_log(msg: &str) {
+    if let Ok(path) = std::env::var("GITTRE_LOG") {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            let t = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0);
+            let _ = writeln!(f, "[{t}] {msg}");
+        }
+    }
+}
+
 impl App {
-    /// `initial`: a scope pre-resolved from CLI flags, already loaded so
-    /// errors surface before the terminal is put into raw mode.
-    pub fn new(repo: Repository, initial: Option<(Scope, DiffResult)>) -> Self {
-        let mut store = CommentStore::load(&repo);
-        let screen = match initial {
-            Some((scope, diff)) => {
-                Screen::Review(Box::new(ReviewState::new(scope, diff, &mut store)))
-            }
-            None => Screen::Picker(build_picker(&repo)),
-        };
+    /// `initial`: a scope pre-resolved (and validated) from CLI flags. Its
+    /// diff loads on the background thread; the TUI appears immediately.
+    pub fn new(repo: Repository, initial: Option<Scope>, watch: bool) -> Self {
+        let store = CommentStore::load(&repo);
         let (event_tx, events) = channel();
         let loader_path = repo.workdir().unwrap_or_else(|| repo.path()).to_path_buf();
         let loader = spawn_loader(loader_path, event_tx.clone());
-        let watcher = watch::spawn(&repo, event_tx);
-        App {
+        let watcher = if watch {
+            watch::spawn(&repo, event_tx)
+        } else {
+            None
+        };
+        let screen = Screen::Picker(build_picker_skeleton(&repo));
+        let mut app = App {
             repo,
             screen,
             show_help: false,
@@ -140,7 +160,18 @@ impl App {
             store,
             comment_draft: None,
             confirm_clear: false,
+            slow_hint_shown: false,
+        };
+        match initial {
+            Some(scope) => app.open_scope(scope),
+            None => app.request_counts(),
         }
+        app
+    }
+
+    fn request_counts(&mut self) {
+        self.seq += 1;
+        let _ = self.loader.send(LoadRequest::Counts { seq: self.seq });
     }
 
     pub fn run(mut self, terminal: &mut DefaultTerminal) -> Result<()> {
@@ -281,35 +312,84 @@ impl App {
     }
 
     fn on_app_event(&mut self, event: AppEvent) {
+        match &event {
+            AppEvent::RepoChanged => debug_log(&format!("event: RepoChanged (seq={})", self.seq)),
+            AppEvent::DiffLoaded { seq, took, .. } => debug_log(&format!(
+                "event: DiffLoaded seq={seq} (cur={}) took={took:?}",
+                self.seq
+            )),
+            AppEvent::CountsLoaded { seq, .. } => {
+                debug_log(&format!("event: CountsLoaded seq={seq} (cur={})", self.seq))
+            }
+        }
         match event {
             AppEvent::RepoChanged => match &self.screen {
                 Screen::Review(review) => {
                     self.seq += 1;
                     self.reloading = true;
-                    let _ = self.loader.send((self.seq, review.scope.clone()));
+                    let scope = review.scope.clone();
+                    let _ = self.loader.send(LoadRequest::Diff {
+                        seq: self.seq,
+                        scope,
+                    });
                 }
                 // Keep the picker's counts fresh too.
-                Screen::Picker(picker) => {
-                    let selected = picker.selected;
-                    let mut rebuilt = build_picker(&self.repo);
-                    rebuilt.selected = selected.min(rebuilt.items.len().saturating_sub(1));
-                    self.screen = Screen::Picker(rebuilt);
-                }
+                Screen::Picker(_) => self.request_counts(),
                 _ => {}
             },
-            AppEvent::DiffLoaded { seq, diff } => {
+            AppEvent::DiffLoaded {
+                seq,
+                scope,
+                diff,
+                took,
+            } => {
                 if seq != self.seq {
                     return; // superseded by a newer request or scope switch
                 }
                 self.reloading = false;
-                if let Screen::Review(review) = &mut self.screen {
-                    match diff {
-                        Ok(diff) => {
-                            apply_reload(review, diff, &mut self.store);
-                            self.reloaded_at = Some(Instant::now());
-                        }
-                        Err(e) => self.error = Some(format!("{e:#}")),
+                let diff = match diff {
+                    Ok(diff) => diff,
+                    Err(e) => {
+                        self.error = Some(format!("{e:#}"));
+                        return;
                     }
+                };
+                if took > Duration::from_secs(1) && self._watcher.is_some() && !self.slow_hint_shown
+                {
+                    self.slow_hint_shown = true;
+                    self.notice = Some(format!(
+                        "diff took {:.1}s — consider --no-watch (r reloads manually)",
+                        took.as_secs_f32()
+                    ));
+                }
+                match &mut self.screen {
+                    // Same scope already open: this is a reload.
+                    Screen::Review(review) if review.scope.label() == scope.label() => {
+                        apply_reload(review, diff, &mut self.store);
+                        self.reloaded_at = Some(Instant::now());
+                    }
+                    // Otherwise it's a scope being opened.
+                    _ => {
+                        let review = ReviewState::new(scope, diff, &mut self.store);
+                        debug_log(&format!(
+                            "review created: {} files",
+                            review.diff.files.len()
+                        ));
+                        self.screen = Screen::Review(Box::new(review));
+                    }
+                }
+            }
+            AppEvent::CountsLoaded { seq, counts } => {
+                if seq != self.seq {
+                    return;
+                }
+                if let Screen::Picker(picker) = &mut self.screen {
+                    let ScopeCounts {
+                        uncommitted,
+                        staged,
+                        branch,
+                    } = counts;
+                    picker.set_counts(uncommitted, staged, branch.map(|(_, n)| n));
                 }
             }
         }
@@ -373,6 +453,9 @@ impl App {
             spans.push(format!(" ✔ {notice}").green());
         } else {
             match &self.screen {
+                Screen::Picker(_) if self.reloading => {
+                    spans.push(" loading diff…".dark_gray().italic())
+                }
                 Screen::Picker(_) => spans.push(" select what to review".dark_gray()),
                 Screen::Log(_) => spans.push(" pick a commit to review".dark_gray()),
                 Screen::Base(_) => spans.push(" pick a base branch".dark_gray()),
@@ -487,6 +570,9 @@ impl App {
                     hints.push(("n/p", "hunk"));
                 }
                 hints.push(("/", "search"));
+                if self._watcher.is_none() {
+                    hints.push(("r", "reload"));
+                }
                 hints.push(("c", "comment"));
                 if review.stream.has_comments() {
                     hints.push(("}/{", "comment nav"));
@@ -870,6 +956,15 @@ impl App {
                 review.stream.start_selection();
             }
             KeyCode::Char('o') => self.open_file_view(),
+            KeyCode::Char('r') => {
+                self.seq += 1;
+                self.reloading = true;
+                let scope = review.scope.clone();
+                let _ = self.loader.send(LoadRequest::Diff {
+                    seq: self.seq,
+                    scope,
+                });
+            }
             KeyCode::Char('e') => {
                 if self.store.comments.is_empty() {
                     self.error = Some("no comments to export".into());
@@ -1083,20 +1178,22 @@ impl App {
         }
     }
 
+    /// Ask the loader for a scope's diff; the screen switches when it lands.
     fn open_scope(&mut self, scope: Scope) {
-        self.seq += 1; // invalidate any in-flight reload
-        self.reloading = false;
-        match diff::load(&self.repo, &scope) {
-            Ok(diff) => {
-                self.screen =
-                    Screen::Review(Box::new(ReviewState::new(scope, diff, &mut self.store)))
-            }
-            Err(e) => self.error = Some(format!("{e:#}")),
-        }
+        self.seq += 1; // invalidate any in-flight response
+        self.reloading = true;
+        let _ = self.loader.send(LoadRequest::Diff {
+            seq: self.seq,
+            scope,
+        });
     }
 
     fn open_picker(&mut self) {
-        self.screen = Screen::Picker(build_picker(&self.repo));
+        self.screen = Screen::Picker(build_picker_skeleton(&self.repo));
+        self.reloading = false;
+        // request_counts bumps seq, which also drops any in-flight diff
+        // for the scope we just left.
+        self.request_counts();
     }
 }
 
@@ -1142,24 +1239,17 @@ fn target_label(t: &CommentTarget) -> String {
     }
 }
 
-fn count_label(n: usize) -> String {
-    if n == 1 {
-        "1 file".into()
-    } else {
-        format!("{n} files")
-    }
-}
-
-fn build_picker(repo: &Repository) -> ScopePicker {
+/// Picker with instant structure; the counts arrive asynchronously.
+fn build_picker_skeleton(repo: &Repository) -> ScopePicker {
     let mut items = vec![
         ScopeItem {
             title: "Uncommitted changes".into(),
-            detail: count_label(file_count(repo, &Scope::Uncommitted)),
+            detail: "…".into(),
             action: ScopeAction::Open(Scope::Uncommitted),
         },
         ScopeItem {
             title: "Staged changes".into(),
-            detail: count_label(file_count(repo, &Scope::Staged)),
+            detail: "…".into(),
             action: ScopeAction::Open(Scope::Staged),
         },
     ];
@@ -1168,7 +1258,7 @@ fn build_picker(repo: &Repository) -> ScopePicker {
             let scope = Scope::Branch { base: base.clone() };
             items.push(ScopeItem {
                 title: format!("Branch vs {base}"),
-                detail: count_label(file_count(repo, &scope)),
+                detail: "…".into(),
                 action: ScopeAction::Open(scope),
             });
         }
