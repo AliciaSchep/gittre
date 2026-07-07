@@ -10,6 +10,16 @@ multi-file diff stream).
 
 ## Install
 
+Prebuilt macOS binaries are attached to
+[GitHub Releases](https://github.com/AliciaSchep/gittre/releases), along with
+a shell installer:
+
+```sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/AliciaSchep/gittre/releases/latest/download/gittre-installer.sh | sh
+```
+
+Or build from source:
+
 ```sh
 cargo install --path .
 ```

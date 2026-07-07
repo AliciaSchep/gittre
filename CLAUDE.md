@@ -96,6 +96,25 @@ Before committing: `cargo fmt && cargo clippy --all-targets && cargo test`
   `Char('d')` must exclude CONTROL or they shadow Ctrl-d paging (clippy's
   unreachable-pattern warning catches this — heed it).
 
+## Releasing
+
+Releases are handled by [cargo-dist](https://opensource.axo.dev/cargo-dist/)
+(config in `dist-workspace.toml`; generated workflow in
+`.github/workflows/release.yml` — regenerate with `dist generate` after
+config changes, never hand-edit it). Targets: macOS arm64 + x86_64, plus a
+shell installer. To cut a release:
+
+```sh
+# 1. bump version in Cargo.toml, commit
+# 2. tag and push — the tag triggers the release workflow
+git tag v0.2.0
+git push && git push --tags
+```
+
+CI builds the artifacts and attaches them to a GitHub Release. Verify config
+changes locally with `dist plan` (what would ship) and `dist build` (real
+host-arch artifacts in `target/distrib/`).
+
 ## Deferred by explicit decision (don't re-litigate, ask first)
 
 Side-by-side view; comment resolve/done state. Both are in PLAN.md with
