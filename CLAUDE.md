@@ -117,5 +117,7 @@ host-arch artifacts in `target/distrib/`).
 
 ## Deferred by explicit decision (don't re-litigate, ask first)
 
-Side-by-side view; comment resolve/done state. Both are in PLAN.md with
-context.
+Side-by-side view; comment resolve/done state (both in PLAN.md with context);
+macOS code signing/notarization (unsigned is fine while installs go through
+the shell installer or cargo — revisit only if browser downloads for
+non-technical users become a real path).
