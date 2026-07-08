@@ -106,6 +106,19 @@ pub fn load_file(repo: &Repository, scope: &super::scope::Scope, path: &str) -> 
 fn collect(diff: &git2::Diff) -> Result<DiffResult> {
     // The foreach callbacks all need mutable access to the same accumulator.
     let result = std::cell::RefCell::new(DiffResult::default());
+    // Time attribution: content between two file callbacks belongs to the
+    // earlier file; anything slow gets named in GITTRE_LOG.
+    let file_clock = std::cell::RefCell::new((std::time::Instant::now(), None::<String>));
+    let lap = |next: Option<String>| {
+        let mut clock = file_clock.borrow_mut();
+        let elapsed = clock.0.elapsed();
+        if let Some(prev) = clock.1.take() {
+            if elapsed > std::time::Duration::from_millis(200) {
+                crate::app::debug_log(&format!("diff slow file: {prev} took {elapsed:?}"));
+            }
+        }
+        *clock = (std::time::Instant::now(), next);
+    };
 
     diff.foreach(
         &mut |delta, _| {
@@ -135,6 +148,13 @@ fn collect(diff: &git2::Diff) -> Result<DiffResult> {
                 additions: 0,
                 deletions: 0,
             });
+            lap(Some(
+                result
+                    .files
+                    .last()
+                    .map(|f| f.path.clone())
+                    .unwrap_or_default(),
+            ));
             true
         },
         Some(&mut |_, _| {
@@ -184,6 +204,7 @@ fn collect(diff: &git2::Diff) -> Result<DiffResult> {
         }),
     )
     .context("walking diff")?;
+    lap(None);
 
     let mut result = result.into_inner();
     // Match the file tree's visual order (directories first, then files,

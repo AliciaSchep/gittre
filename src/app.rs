@@ -94,6 +94,8 @@ pub struct App {
     confirm_clear: bool,
     /// The "reloads are slow, try --no-watch" hint fires at most once.
     slow_hint_shown: bool,
+    /// A repo change arrived while a load was in flight; reload once after.
+    reload_queued: bool,
 }
 
 struct CommentDraft {
@@ -161,6 +163,7 @@ impl App {
             comment_draft: None,
             confirm_clear: false,
             slow_hint_shown: false,
+            reload_queued: false,
         };
         match initial {
             Some(scope) => app.open_scope(scope),
@@ -328,6 +331,12 @@ impl App {
         match event {
             AppEvent::RepoChanged => match &self.screen {
                 Screen::Review(review) => {
+                    // Never stack reloads: on repos where a diff takes
+                    // seconds, a watcher storm would otherwise grind forever.
+                    if self.reloading {
+                        self.reload_queued = true;
+                        return;
+                    }
                     self.seq += 1;
                     self.reloading = true;
                     let scope = review.scope.clone();

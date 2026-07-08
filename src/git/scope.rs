@@ -117,7 +117,11 @@ fn build_diff_with<'r>(
         Scope::Uncommitted => {
             opts.include_untracked(true)
                 .recurse_untracked_dirs(true)
-                .show_untracked_content(true);
+                .show_untracked_content(true)
+                // Refresh stale index stat-cache entries (like `git status`
+                // does). Without this, libgit2 re-hashes every mistrusted
+                // file on EVERY diff — the cost gets paid once instead.
+                .update_index(true);
             let head_tree = head_tree(repo)?;
             repo.diff_tree_to_workdir_with_index(head_tree.as_ref(), Some(&mut opts))
                 .context("diffing working tree vs HEAD")?
