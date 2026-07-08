@@ -16,6 +16,8 @@ pub enum LoadRequest {
     Diff { seq: u64, scope: Scope },
     /// Compute the scope picker's file counts.
     Counts { seq: u64 },
+    /// Expand one large-file stub (no size cap).
+    File { scope: Scope, path: String },
 }
 
 pub struct ScopeCounts {
@@ -41,6 +43,11 @@ pub enum AppEvent {
         seq: u64,
         counts: ScopeCounts,
     },
+    /// One file's full diff, for splicing into an open review.
+    FileLoaded {
+        scope_label: String,
+        file: Result<crate::git::diff::FileDiff>,
+    },
 }
 
 /// Spawn the background loader. git2 handles can't be shared across threads,
@@ -52,16 +59,33 @@ pub fn spawn_loader(repo_path: PathBuf, events: Sender<AppEvent>) -> Sender<Load
             return;
         };
         while let Ok(first) = req_rx.recv() {
-            // Coalesce a burst down to the newest request of each kind.
+            // Coalesce a burst down to the newest request of each kind
+            // (file expansions are all kept — each is a distinct file).
             let mut diff_req = None;
             let mut counts_req = None;
+            let mut file_reqs = Vec::new();
             let mut sort = |req: LoadRequest| match req {
                 LoadRequest::Diff { .. } => diff_req = Some(req),
                 LoadRequest::Counts { .. } => counts_req = Some(req),
+                LoadRequest::File { .. } => file_reqs.push(req),
             };
             sort(first);
             while let Ok(req) = req_rx.try_recv() {
                 sort(req);
+            }
+
+            for req in file_reqs {
+                let LoadRequest::File { scope, path } = req else {
+                    continue;
+                };
+                let file = diff::load_file(&repo, &scope, &path);
+                let event = AppEvent::FileLoaded {
+                    scope_label: scope.label(),
+                    file,
+                };
+                if events.send(event).is_err() {
+                    return;
+                }
             }
 
             if let Some(LoadRequest::Diff { seq, scope }) = diff_req {

@@ -13,6 +13,8 @@ enum Row {
     Spacer,
     FileHeader(usize),
     Binary,
+    /// Oversized file whose diff wasn't loaded; Enter expands it.
+    LargeStub(usize),
     HunkHeader(usize, usize),
     Line(usize, usize, usize),
     /// Comment block header; the index is into the comment store slice.
@@ -108,6 +110,10 @@ impl Stream {
                     push_comment(&mut rows, &mut comment_starts, ci, true);
                 }
             }
+            if file.large && file.hunks.is_empty() {
+                rows.push(Row::LargeStub(fi));
+                continue;
+            }
             if file.binary {
                 rows.push(Row::Binary);
                 continue;
@@ -200,6 +206,14 @@ impl Stream {
 
     pub fn has_comments(&self) -> bool {
         !self.comment_starts.is_empty()
+    }
+
+    /// File index if the cursor is on a large-file stub row.
+    pub fn large_stub_at_cursor(&self) -> Option<usize> {
+        match self.rows.get(self.cursor) {
+            Some(Row::LargeStub(fi)) => Some(*fi),
+            _ => None,
+        }
     }
 
     /// The comment whose block the cursor is on, if any.
@@ -694,6 +708,14 @@ impl Stream {
                 Line::from(spans).on_dark_gray()
             }
             Row::Binary => Line::from("   (binary file changed)".dark_gray().italic()),
+            Row::LargeStub(fi) => {
+                let size = files[fi].byte_size;
+                Line::from(vec![
+                    "   ▶ ".cyan(),
+                    format!("large file ({}) — diff not loaded", human_size(size)).italic(),
+                    "  [⏎ load]".bold().cyan(),
+                ])
+            }
             Row::CommentHeader(ci) => {
                 let c = &comments[ci];
                 let range = if c.lines.0 == c.lines.1 {
@@ -759,6 +781,14 @@ impl Stream {
     }
 }
 
+fn human_size(bytes: u64) -> String {
+    if bytes >= 1024 * 1024 {
+        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+    } else {
+        format!("{} KB", bytes / 1024)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -770,6 +800,8 @@ mod tests {
             old_path: None,
             status: FileStatus::Modified,
             binary: false,
+            large: false,
+            byte_size: 0,
             hunks: vec![Hunk {
                 header: "@@ @@".into(),
                 lines: (0..lines)

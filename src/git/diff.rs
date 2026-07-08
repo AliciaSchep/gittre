@@ -46,6 +46,11 @@ pub struct FileDiff {
     pub old_path: Option<String>,
     pub status: FileStatus,
     pub binary: bool,
+    /// Content skipped because the file exceeds MAX_CONTENT_FILE_SIZE;
+    /// the UI offers to load it on demand.
+    pub large: bool,
+    /// Size of the bigger side, for the stub label.
+    pub byte_size: u64,
     pub hunks: Vec<Hunk>,
     pub additions: usize,
     pub deletions: usize,
@@ -70,8 +75,32 @@ fn delta_status(delta: Delta) -> FileStatus {
 
 /// Load the full structured diff for a scope.
 pub fn load(repo: &Repository, scope: &super::scope::Scope) -> Result<DiffResult> {
+    let t = std::time::Instant::now();
     let diff = super::scope::build_diff(repo, scope)?;
-    collect(&diff)
+    crate::app::debug_log(&format!(
+        "diff phase: build+renames {:?} ({} deltas)",
+        t.elapsed(),
+        diff.deltas().len()
+    ));
+    let t = std::time::Instant::now();
+    let result = collect(&diff);
+    crate::app::debug_log(&format!("diff phase: content walk {:?}", t.elapsed()));
+    result
+}
+
+/// Load one file's full diff (no size cap), for expanding a large stub.
+pub fn load_file(repo: &Repository, scope: &super::scope::Scope, path: &str) -> Result<FileDiff> {
+    let diff = super::scope::build_file_diff(repo, scope, path)?;
+    let mut result = collect(&diff)?;
+    result
+        .files
+        .drain(..)
+        .find(|f| f.path == path)
+        .map(|mut f| {
+            f.large = false;
+            f
+        })
+        .ok_or_else(|| anyhow::anyhow!("'{path}' no longer in the diff"))
 }
 
 fn collect(diff: &git2::Diff) -> Result<DiffResult> {
@@ -93,11 +122,15 @@ fn collect(diff: &git2::Diff) -> Result<DiffResult> {
                 }
                 _ => None,
             };
+            let byte_size = delta.new_file().size().max(delta.old_file().size());
+            let over_cap = byte_size > super::scope::MAX_CONTENT_FILE_SIZE as u64;
             result.files.push(FileDiff {
                 path,
                 old_path,
                 status: delta_status(delta.status()),
-                binary: delta.new_file().is_binary() || delta.old_file().is_binary(),
+                binary: !over_cap && (delta.new_file().is_binary() || delta.old_file().is_binary()),
+                large: over_cap,
+                byte_size,
                 hunks: Vec::new(),
                 additions: 0,
                 deletions: 0,
@@ -388,6 +421,25 @@ mod tests {
             ]
         );
         assert_eq!(tree_order("a.txt", "a.txt"), Ordering::Equal);
+    }
+
+    #[test]
+    fn oversized_files_become_stubs_and_load_on_demand() {
+        let (dir, repo) = setup();
+        let big: String = "0123456789abcdef\n".repeat(80_000); // ~1.3 MB
+        fs::write(dir.path().join("big.txt"), &big).unwrap();
+        commit_all(&repo, "add big");
+        fs::write(dir.path().join("big.txt"), format!("{big}one more line\n")).unwrap();
+
+        let result = load_uncommitted(&repo).unwrap();
+        let stub = find(&result, "big.txt");
+        assert!(stub.large, "over-cap file should be a stub");
+        assert!(stub.hunks.is_empty(), "no content loaded up front");
+        assert!(stub.byte_size > 1024 * 1024);
+
+        let loaded = load_file(&repo, &Scope::Uncommitted, "big.txt").unwrap();
+        assert!(!loaded.large);
+        assert_eq!(loaded.additions, 1, "on-demand load has real hunks");
     }
 
     #[test]

@@ -97,8 +97,21 @@ pub fn base_candidates(repo: &Repository) -> Vec<String> {
 /// Build the raw git2 diff for a scope. Shared by the full loader (which walks
 /// content) and the picker's file counts (which only look at deltas).
 pub fn build_diff<'r>(repo: &'r Repository, scope: &Scope) -> Result<git2::Diff<'r>> {
+    build_diff_with(repo, scope, |opts| {
+        // Oversized files get no content here; collect() turns them into
+        // stubs the UI expands on demand via build_file_diff.
+        opts.max_size(MAX_CONTENT_FILE_SIZE);
+    })
+}
+
+fn build_diff_with<'r>(
+    repo: &'r Repository,
+    scope: &Scope,
+    configure: impl FnOnce(&mut DiffOptions),
+) -> Result<git2::Diff<'r>> {
     let mut opts = DiffOptions::new();
     opts.include_typechange(true);
+    configure(&mut opts);
 
     let mut diff = match scope {
         Scope::Uncommitted => {
@@ -156,13 +169,32 @@ pub fn build_diff<'r>(repo: &'r Repository, scope: &Scope) -> Result<git2::Diff<
     // dominate load time, so skip it past a threshold (statuses still show
     // as delete+add, which is honest if less pretty).
     if diff.deltas().len() <= RENAME_DETECTION_LIMIT {
+        let t = std::time::Instant::now();
         diff.find_similar(None).ok();
+        crate::app::debug_log(&format!("diff phase: rename detection {:?}", t.elapsed()));
     }
     Ok(diff)
 }
 
 /// Above this many changed files, skip rename detection.
 const RENAME_DETECTION_LIMIT: usize = 2000;
+
+/// Files above this size (bytes) get no content diff up front; the UI shows
+/// a stub and loads the file's diff on demand (GitHub-style).
+pub const MAX_CONTENT_FILE_SIZE: i64 = 1024 * 1024;
+
+/// Build the diff for a single path within a scope, with no size cap —
+/// used to expand a large-file stub on demand.
+pub fn build_file_diff<'r>(
+    repo: &'r Repository,
+    scope: &Scope,
+    path: &str,
+) -> Result<git2::Diff<'r>> {
+    let diff = build_diff_with(repo, scope, |opts| {
+        opts.pathspec(path);
+    })?;
+    Ok(diff)
+}
 
 /// Number of changed files in a scope, built as cheaply as possible: no
 /// untracked contents, no rename detection. Counts only — never reuse for

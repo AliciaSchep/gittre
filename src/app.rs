@@ -321,6 +321,9 @@ impl App {
             AppEvent::CountsLoaded { seq, .. } => {
                 debug_log(&format!("event: CountsLoaded seq={seq} (cur={})", self.seq))
             }
+            AppEvent::FileLoaded { scope_label, .. } => {
+                debug_log(&format!("event: FileLoaded for {scope_label}"))
+            }
         }
         match event {
             AppEvent::RepoChanged => match &self.screen {
@@ -378,6 +381,29 @@ impl App {
                         self.screen = Screen::Review(Box::new(review));
                     }
                 }
+            }
+            AppEvent::FileLoaded { scope_label, file } => {
+                let loaded = match file {
+                    Ok(f) => f,
+                    Err(e) => {
+                        self.error = Some(format!("{e:#}"));
+                        return;
+                    }
+                };
+                let matches_screen = matches!(
+                    &self.screen,
+                    Screen::Review(r) if r.scope.label() == scope_label
+                );
+                if !matches_screen {
+                    return;
+                }
+                if let Screen::Review(review) = &mut self.screen {
+                    if let Some(slot) = review.diff.files.iter_mut().find(|f| f.path == loaded.path)
+                    {
+                        *slot = loaded;
+                    }
+                }
+                self.rebuild_review();
             }
             AppEvent::CountsLoaded { seq, counts } => {
                 if seq != self.seq {
@@ -542,6 +568,15 @@ impl App {
                         ("g/G", "top/bottom"),
                         ("E", "open in $EDITOR"),
                         ("q/Esc", "back to diff"),
+                    ];
+                }
+                if review.stream.large_stub_at_cursor().is_some() {
+                    return vec![
+                        ("⏎", "load this file's diff"),
+                        ("↑↓/jk", "scroll"),
+                        ("]/[", "file"),
+                        ("x/q", "scope"),
+                        ("?", "help"),
                     ];
                 }
                 if review.stream.has_selection() {
@@ -1110,6 +1145,13 @@ impl App {
                         review.stream.jump_to_file(file_idx);
                         review.focus = Focus::Stream;
                     }
+                } else if let Some(fi) = review.stream.large_stub_at_cursor() {
+                    let path = review.diff.files[fi].path.clone();
+                    self.notice = Some(format!("loading diff for {path}…"));
+                    let _ = self.loader.send(LoadRequest::File {
+                        scope: review.scope.clone(),
+                        path,
+                    });
                 }
             }
             _ => {}

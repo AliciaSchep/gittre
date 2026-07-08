@@ -61,6 +61,9 @@ src/ui/{picker,fileview,bar,popups,highlight}.rs
 - Rename detection is skipped above `RENAME_DETECTION_LIMIT` changed files;
   `--no-watch` + `r` is the escape hatch for repos where reloads are costly
   (a one-time hint suggests it when a reload exceeds 1s).
+- Files over `MAX_CONTENT_FILE_SIZE` (1MB) load as **stubs** (GitHub-style):
+  no content up front, `Enter` on the stub loads that one file's diff via the
+  loader thread and splices it in. Diff-load phase timings go to GITTRE_LOG.
 - **Worktrees:** never assume `<workdir>/.git` is a directory. Use
   `repo.path()` (per-worktree gitdir) and `repo.commondir()` (shared refs) —
   the watcher and comment store depend on this.
