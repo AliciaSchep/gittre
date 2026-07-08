@@ -63,6 +63,21 @@ pub struct DiffResult {
     pub deletions: usize,
 }
 
+impl DiffResult {
+    /// Sort into tree order and compute totals.
+    pub fn from_files(mut files: Vec<FileDiff>) -> Self {
+        files.sort_by(|a, b| tree_order(&a.path, &b.path));
+        let (additions, deletions) = files
+            .iter()
+            .fold((0, 0), |(a, d), f| (a + f.additions, d + f.deletions));
+        DiffResult {
+            files,
+            additions,
+            deletions,
+        }
+    }
+}
+
 fn delta_status(delta: Delta) -> FileStatus {
     match delta {
         Delta::Added | Delta::Untracked | Delta::Copied => FileStatus::Added,
@@ -74,7 +89,28 @@ fn delta_status(delta: Delta) -> FileStatus {
 }
 
 /// Load the full structured diff for a scope.
+///
+/// Worktree scopes go through the `git` CLI (fsmonitor, untracked cache,
+/// parallelism — libgit2 has none of these and is 10-100x slower on large
+/// repos); object-database scopes stay on libgit2. If the CLI path fails
+/// (no git binary, unborn HEAD, …), fall back to libgit2.
 pub fn load(repo: &Repository, scope: &super::scope::Scope) -> Result<DiffResult> {
+    use super::scope::Scope;
+    if let (Some(workdir), Some(staged)) = (
+        repo.workdir(),
+        match scope {
+            Scope::Uncommitted => Some(false),
+            Scope::Staged => Some(true),
+            _ => None,
+        },
+    ) {
+        match super::cli::load_worktree(workdir, staged) {
+            Ok(result) => return Ok(result),
+            Err(e) => {
+                crate::app::debug_log(&format!("cli diff failed, using libgit2: {e:#}"));
+            }
+        }
+    }
     let t = std::time::Instant::now();
     let diff = super::scope::build_diff(repo, scope)?;
     crate::app::debug_log(&format!(
@@ -90,6 +126,19 @@ pub fn load(repo: &Repository, scope: &super::scope::Scope) -> Result<DiffResult
 
 /// Load one file's full diff (no size cap), for expanding a large stub.
 pub fn load_file(repo: &Repository, scope: &super::scope::Scope, path: &str) -> Result<FileDiff> {
+    use super::scope::Scope;
+    if let (Some(workdir), Some(staged)) = (
+        repo.workdir(),
+        match scope {
+            Scope::Uncommitted => Some(false),
+            Scope::Staged => Some(true),
+            _ => None,
+        },
+    ) {
+        if let Ok(file) = super::cli::load_worktree_file(workdir, staged, path) {
+            return Ok(file);
+        }
+    }
     let diff = super::scope::build_file_diff(repo, scope, path)?;
     let mut result = collect(&diff)?;
     result
@@ -206,18 +255,10 @@ fn collect(diff: &git2::Diff) -> Result<DiffResult> {
     .context("walking diff")?;
     lap(None);
 
-    let mut result = result.into_inner();
     // Match the file tree's visual order (directories first, then files,
     // alphabetical at each level) so scrolling the stream and walking the
     // tree traverse files in the same sequence.
-    result.files.sort_by(|a, b| tree_order(&a.path, &b.path));
-    let (adds, dels) = result
-        .files
-        .iter()
-        .fold((0, 0), |(a, d), f| (a + f.additions, d + f.deletions));
-    result.additions = adds;
-    result.deletions = dels;
-    Ok(result)
+    Ok(DiffResult::from_files(result.into_inner().files))
 }
 
 fn tree_order(a: &str, b: &str) -> std::cmp::Ordering {
@@ -445,22 +486,41 @@ mod tests {
     }
 
     #[test]
-    fn oversized_files_become_stubs_and_load_on_demand() {
+    fn oversized_diffs_become_stubs_and_load_on_demand() {
         let (dir, repo) = setup();
         let big: String = "0123456789abcdef\n".repeat(80_000); // ~1.3 MB
         fs::write(dir.path().join("big.txt"), &big).unwrap();
         commit_all(&repo, "add big");
-        fs::write(dir.path().join("big.txt"), format!("{big}one more line\n")).unwrap();
 
+        // A small change to a big file stays inline: the patch is tiny.
+        fs::write(dir.path().join("big.txt"), format!("{big}one more line\n")).unwrap();
+        let result = load_uncommitted(&repo).unwrap();
+        let small_change = find(&result, "big.txt");
+        assert!(
+            !small_change.large,
+            "small patch to a big file shows inline"
+        );
+        assert_eq!(small_change.additions, 1);
+
+        // A full rewrite produces an over-cap patch: stubbed.
+        let rewritten: String = "fedcba9876543210\n".repeat(80_000);
+        fs::write(dir.path().join("big.txt"), &rewritten).unwrap();
         let result = load_uncommitted(&repo).unwrap();
         let stub = find(&result, "big.txt");
-        assert!(stub.large, "over-cap file should be a stub");
-        assert!(stub.hunks.is_empty(), "no content loaded up front");
+        assert!(stub.large, "over-cap patch should be a stub");
+        assert!(stub.hunks.is_empty(), "no content held up front");
         assert!(stub.byte_size > 1024 * 1024);
 
         let loaded = load_file(&repo, &Scope::Uncommitted, "big.txt").unwrap();
         assert!(!loaded.large);
-        assert_eq!(loaded.additions, 1, "on-demand load has real hunks");
+        assert!(loaded.additions >= 80_000, "on-demand load has real hunks");
+
+        // A big untracked file stubs by file size (content never read).
+        fs::write(dir.path().join("bignew.txt"), &big).unwrap();
+        let result = load_uncommitted(&repo).unwrap();
+        let untracked = find(&result, "bignew.txt");
+        assert!(untracked.large);
+        assert!(untracked.hunks.is_empty());
     }
 
     #[test]

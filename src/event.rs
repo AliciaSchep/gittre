@@ -102,9 +102,20 @@ pub fn spawn_loader(repo_path: PathBuf, events: Sender<AppEvent>) -> Sender<Load
                 }
             }
             if let Some(LoadRequest::Counts { seq }) = counts_req {
+                // One `git status` gives both worktree counts (fast even on
+                // huge repos when fsmonitor is on); libgit2 as fallback.
+                let (uncommitted, staged) = repo
+                    .workdir()
+                    .and_then(|wd| crate::git::cli::worktree_counts(wd).ok())
+                    .unwrap_or_else(|| {
+                        (
+                            scope::file_count_fast(&repo, &Scope::Uncommitted),
+                            scope::file_count_fast(&repo, &Scope::Staged),
+                        )
+                    });
                 let counts = ScopeCounts {
-                    uncommitted: scope::file_count_fast(&repo, &Scope::Uncommitted),
-                    staged: scope::file_count_fast(&repo, &Scope::Staged),
+                    uncommitted,
+                    staged,
                     branch: scope::detect_base(&repo).map(|base| {
                         let scope = Scope::Branch { base: base.clone() };
                         (base, scope::file_count_fast(&repo, &scope))

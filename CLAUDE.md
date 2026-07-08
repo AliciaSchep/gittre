@@ -28,8 +28,10 @@ src/watch.rs       notify watcher -> debounced RepoChanged (worktree-aware,
                    git-ignore filtered)
 src/comments.rs    comment model, JSON store (<gitdir>/gittre/), re-anchoring
                    cascade (exact -> moved -> outdated), markdown export
-src/git/scope.rs   Scope enum, diff building per scope, base detection,
-                   full-file content per scope
+src/git/cli.rs     worktree diffs via the git CLI (unified-diff parser,
+                   status parsing, untracked synthesis) — see invariant below
+src/git/scope.rs   Scope enum, libgit2 diff building per scope, base
+                   detection, full-file content per scope
 src/git/diff.rs    git2 diff -> DiffResult (tree-order sorted; tested here)
 src/git/log.rs     commit list for the picker
 src/ui/review.rs   the diff Stream: rows, cursor, selection, search, comment
@@ -58,6 +60,14 @@ src/ui/{picker,fileview,bar,popups,highlight}.rs
   loads, reloads, picker counts) goes through the loader thread; the picker
   renders instantly with "…" counts that fill in. Keep it that way — a
   synchronous diff on the UI thread is exactly what made large repos hang.
+- **Worktree scopes (uncommitted/staged) shell out to `git`** and parse its
+  output (src/git/cli.rs); libgit2 lacks fsmonitor/untracked-cache/parallelism
+  and measured 20x slower on a large repo. Object-database scopes
+  (commit/branch/range) stay on libgit2, where it is fast. The libgit2
+  worktree path remains only as a fallback (no git binary, unborn HEAD).
+  This also means users can fix slow repos with
+  `git config core.fsmonitor true` + `core.untrackedCache true` — gittre
+  inherits it.
 - Rename detection is skipped above `RENAME_DETECTION_LIMIT` changed files;
   `--no-watch` + `r` is the escape hatch for repos where reloads are costly
   (a one-time hint suggests it when a reload exceeds 1s).
