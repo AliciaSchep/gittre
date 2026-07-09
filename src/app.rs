@@ -96,6 +96,10 @@ pub struct App {
     slow_hint_shown: bool,
     /// A repo change arrived while a load was in flight; reload once after.
     reload_queued: bool,
+    /// Watcher events before this instant are our own doing (git status /
+    /// diff write the index, e.g. the fsmonitor token) and must be ignored
+    /// or they'd form a reload feedback loop.
+    ignore_events_until: Option<Instant>,
 }
 
 struct CommentDraft {
@@ -164,6 +168,7 @@ impl App {
             confirm_clear: false,
             slow_hint_shown: false,
             reload_queued: false,
+            ignore_events_until: None,
         };
         match initial {
             Some(scope) => app.open_scope(scope),
@@ -328,6 +333,14 @@ impl App {
                 debug_log(&format!("event: FileLoaded for {scope_label}"))
             }
         }
+        if matches!(event, AppEvent::RepoChanged)
+            && self
+                .ignore_events_until
+                .is_some_and(|until| Instant::now() < until)
+        {
+            debug_log("suppressed self-induced RepoChanged");
+            return;
+        }
         match event {
             AppEvent::RepoChanged => match &self.screen {
                 Screen::Review(review) => {
@@ -355,6 +368,7 @@ impl App {
                 diff,
                 took,
             } => {
+                self.ignore_events_until = Some(Instant::now() + Duration::from_millis(700));
                 if seq != self.seq {
                     return; // superseded by a newer request or scope switch
                 }
@@ -392,6 +406,7 @@ impl App {
                 }
             }
             AppEvent::FileLoaded { scope_label, file } => {
+                self.ignore_events_until = Some(Instant::now() + Duration::from_millis(700));
                 let loaded = match file {
                     Ok(f) => f,
                     Err(e) => {
@@ -415,6 +430,7 @@ impl App {
                 self.rebuild_review();
             }
             AppEvent::CountsLoaded { seq, counts } => {
+                self.ignore_events_until = Some(Instant::now() + Duration::from_millis(700));
                 if seq != self.seq {
                     return;
                 }

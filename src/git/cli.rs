@@ -142,8 +142,14 @@ fn is_untracked(workdir: &Path, path: &str) -> Result<bool> {
         .any(|(x, y, p)| x == '?' && y == '?' && p == path))
 }
 
+/// Inline untracked contents only this far; everything beyond becomes a
+/// stub (Enter loads it), so a sea of untracked files can't dominate loads.
+const UNTRACKED_INLINE_MAX_FILES: usize = 200;
+const UNTRACKED_INLINE_MAX_BYTES: u64 = 4 * 1024 * 1024;
+
 /// Untracked files as "added" diffs, content inlined below the size cap.
 fn untracked_files(workdir: &Path) -> Result<Vec<FileDiff>> {
+    let t = std::time::Instant::now();
     let out = run(
         {
             let mut cmd = git(workdir);
@@ -152,16 +158,31 @@ fn untracked_files(workdir: &Path) -> Result<Vec<FileDiff>> {
         },
         "status",
     )?;
+    crate::app::debug_log(&format!("cli phase: untracked status {:?}", t.elapsed()));
+
+    let t = std::time::Instant::now();
     let mut files = Vec::new();
+    let mut inlined_bytes: u64 = 0;
     for (x, y, path) in parse_status_z(&out) {
-        if x == '?' && y == '?' {
-            files.push(untracked_file(
-                workdir,
-                &path,
-                MAX_CONTENT_FILE_SIZE as u64,
-            )?);
+        if x != '?' || y != '?' {
+            continue;
         }
+        let over_budget =
+            files.len() >= UNTRACKED_INLINE_MAX_FILES || inlined_bytes > UNTRACKED_INLINE_MAX_BYTES;
+        let cap = if over_budget {
+            0 // stub: name and size only, no content read
+        } else {
+            MAX_CONTENT_FILE_SIZE as u64
+        };
+        let file = untracked_file(workdir, &path, cap)?;
+        inlined_bytes += if file.large { 0 } else { file.byte_size };
+        files.push(file);
     }
+    crate::app::debug_log(&format!(
+        "cli phase: untracked contents {:?} ({} files)",
+        t.elapsed(),
+        files.len()
+    ));
     Ok(files)
 }
 
