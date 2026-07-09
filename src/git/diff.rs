@@ -51,6 +51,8 @@ pub struct FileDiff {
     pub large: bool,
     /// Size of the bigger side, for the stub label.
     pub byte_size: u64,
+    /// An untracked directory (collapsed, GitHub-style); Enter lists it.
+    pub untracked_dir: bool,
     pub hunks: Vec<Hunk>,
     pub additions: usize,
     pub deletions: usize,
@@ -193,6 +195,7 @@ fn collect(diff: &git2::Diff) -> Result<DiffResult> {
                 binary: !over_cap && (delta.new_file().is_binary() || delta.old_file().is_binary()),
                 large: over_cap,
                 byte_size,
+                untracked_dir: false,
                 hunks: Vec::new(),
                 additions: 0,
                 deletions: 0,

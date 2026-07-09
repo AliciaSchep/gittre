@@ -290,6 +290,7 @@ mod tests {
                 binary: false,
                 large: false,
                 byte_size: 0,
+                untracked_dir: false,
                 hunks: vec![Hunk {
                     header: "@@ @@".into(),
                     lines: new_linenos
@@ -348,6 +349,7 @@ mod tests {
                 binary: false,
                 large: false,
                 byte_size: 0,
+                untracked_dir: false,
                 hunks: vec![Hunk {
                     header: "@@ @@".into(),
                     lines: [(13, "line 10"), (14, "line 11"), (15, "line 12")]
@@ -406,6 +408,7 @@ mod tests {
                 binary: false,
                 large: false,
                 byte_size: 0,
+                untracked_dir: false,
                 hunks: vec![Hunk {
                     header: "@@ @@".into(),
                     lines: vec![DiffLine {

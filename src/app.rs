@@ -329,9 +329,9 @@ impl App {
             AppEvent::CountsLoaded { seq, .. } => {
                 debug_log(&format!("event: CountsLoaded seq={seq} (cur={})", self.seq))
             }
-            AppEvent::FileLoaded { scope_label, .. } => {
-                debug_log(&format!("event: FileLoaded for {scope_label}"))
-            }
+            AppEvent::FileLoaded {
+                scope_label, path, ..
+            } => debug_log(&format!("event: FileLoaded {path} ({scope_label})")),
         }
         if matches!(event, AppEvent::RepoChanged)
             && self
@@ -405,9 +405,13 @@ impl App {
                     }
                 }
             }
-            AppEvent::FileLoaded { scope_label, file } => {
+            AppEvent::FileLoaded {
+                scope_label,
+                path,
+                files,
+            } => {
                 self.ignore_events_until = Some(Instant::now() + Duration::from_millis(700));
-                let loaded = match file {
+                let loaded = match files {
                     Ok(f) => f,
                     Err(e) => {
                         self.error = Some(format!("{e:#}"));
@@ -422,9 +426,11 @@ impl App {
                     return;
                 }
                 if let Screen::Review(review) = &mut self.screen {
-                    if let Some(slot) = review.diff.files.iter_mut().find(|f| f.path == loaded.path)
-                    {
-                        *slot = loaded;
+                    if let Some(pos) = review.diff.files.iter().position(|f| f.path == path) {
+                        review.diff.files.splice(pos..=pos, loaded);
+                        // Re-sort and re-total after the splice.
+                        review.diff =
+                            DiffResult::from_files(std::mem::take(&mut review.diff.files));
                     }
                 }
                 self.rebuild_review();
@@ -597,7 +603,7 @@ impl App {
                 }
                 if review.stream.large_stub_at_cursor().is_some() {
                     return vec![
-                        ("⏎", "load this file's diff"),
+                        ("⏎", "expand"),
                         ("↑↓/jk", "scroll"),
                         ("]/[", "file"),
                         ("x/q", "scope"),
@@ -1172,10 +1178,16 @@ impl App {
                     }
                 } else if let Some(fi) = review.stream.large_stub_at_cursor() {
                     let path = review.diff.files[fi].path.clone();
-                    self.notice = Some(format!("loading diff for {path}…"));
+                    let untracked_dir = review.diff.files[fi].untracked_dir;
+                    self.notice = Some(if untracked_dir {
+                        format!("listing {path}/…")
+                    } else {
+                        format!("loading diff for {path}…")
+                    });
                     let _ = self.loader.send(LoadRequest::File {
                         scope: review.scope.clone(),
                         path,
+                        untracked_dir,
                     });
                 }
             }

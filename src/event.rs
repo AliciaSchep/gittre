@@ -16,8 +16,12 @@ pub enum LoadRequest {
     Diff { seq: u64, scope: Scope },
     /// Compute the scope picker's file counts.
     Counts { seq: u64 },
-    /// Expand one large-file stub (no size cap).
-    File { scope: Scope, path: String },
+    /// Expand one stub: a large file (no size cap) or an untracked dir.
+    File {
+        scope: Scope,
+        path: String,
+        untracked_dir: bool,
+    },
 }
 
 pub struct ScopeCounts {
@@ -43,10 +47,11 @@ pub enum AppEvent {
         seq: u64,
         counts: ScopeCounts,
     },
-    /// One file's full diff, for splicing into an open review.
+    /// Expansion result: one or more files replacing the stub at `path`.
     FileLoaded {
         scope_label: String,
-        file: Result<crate::git::diff::FileDiff>,
+        path: String,
+        files: Result<Vec<crate::git::diff::FileDiff>>,
     },
 }
 
@@ -75,13 +80,25 @@ pub fn spawn_loader(repo_path: PathBuf, events: Sender<AppEvent>) -> Sender<Load
             }
 
             for req in file_reqs {
-                let LoadRequest::File { scope, path } = req else {
+                let LoadRequest::File {
+                    scope,
+                    path,
+                    untracked_dir,
+                } = req
+                else {
                     continue;
                 };
-                let file = diff::load_file(&repo, &scope, &path);
+                let files = if untracked_dir {
+                    repo.workdir()
+                        .ok_or_else(|| anyhow::anyhow!("no working directory"))
+                        .and_then(|wd| crate::git::cli::load_untracked_dir(wd, &path))
+                } else {
+                    diff::load_file(&repo, &scope, &path).map(|f| vec![f])
+                };
                 let event = AppEvent::FileLoaded {
                     scope_label: scope.label(),
-                    file,
+                    path,
+                    files,
                 };
                 if events.send(event).is_err() {
                     return;

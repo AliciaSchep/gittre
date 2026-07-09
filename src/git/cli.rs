@@ -38,15 +38,27 @@ fn run(mut cmd: Command, what: &str) -> Result<String> {
 
 /// Working tree + index vs HEAD (untracked included), or index vs HEAD.
 pub fn load_worktree(workdir: &Path, staged: bool) -> Result<DiffResult> {
-    let t = std::time::Instant::now();
-    let mut cmd = git(workdir);
-    cmd.args(["diff", "--no-color", "--no-ext-diff", "-M", "-p"]);
-    if staged {
-        cmd.arg("--cached");
-    }
-    cmd.arg("HEAD");
-    let patch = run(cmd, "diff")?;
-    crate::app::debug_log(&format!("cli phase: git diff {:?}", t.elapsed()));
+    // `git diff` and the untracked scan are independent processes; run them
+    // concurrently so the load costs max(diff, status) instead of the sum.
+    let (patch, untracked) = std::thread::scope(|scope| {
+        let untracked_handle = (!staged).then(|| scope.spawn(|| untracked_files(workdir)));
+        let t = std::time::Instant::now();
+        let mut cmd = git(workdir);
+        cmd.args(["diff", "--no-color", "--no-ext-diff", "-M", "-p"]);
+        if staged {
+            cmd.arg("--cached");
+        }
+        cmd.arg("HEAD");
+        let patch = run(cmd, "diff");
+        crate::app::debug_log(&format!("cli phase: git diff {:?}", t.elapsed()));
+        let untracked = match untracked_handle {
+            Some(h) => h.join().unwrap_or_else(|_| Ok(Vec::new())),
+            None => Ok(Vec::new()),
+        };
+        (patch, untracked)
+    });
+    let patch = patch?;
+    let untracked = untracked?;
 
     let t = std::time::Instant::now();
     let mut files = parse_patch(&patch);
@@ -75,11 +87,7 @@ pub fn load_worktree(workdir: &Path, staged: bool) -> Result<DiffResult> {
         }
     }
 
-    if !staged {
-        let t = std::time::Instant::now();
-        files.extend(untracked_files(workdir)?);
-        crate::app::debug_log(&format!("cli phase: untracked {:?}", t.elapsed()));
-    }
+    files.extend(untracked);
 
     Ok(DiffResult::from_files(files))
 }
@@ -147,13 +155,16 @@ fn is_untracked(workdir: &Path, path: &str) -> Result<bool> {
 const UNTRACKED_INLINE_MAX_FILES: usize = 200;
 const UNTRACKED_INLINE_MAX_BYTES: u64 = 4 * 1024 * 1024;
 
-/// Untracked files as "added" diffs, content inlined below the size cap.
+/// Untracked files and directories, git-status style: `normal` mode, so
+/// fully-untracked directories come back collapsed as one entry (this is
+/// also the only mode git's untracked cache accelerates). Directories show
+/// as expandable stubs; loose files inline their content below the budget.
 fn untracked_files(workdir: &Path) -> Result<Vec<FileDiff>> {
     let t = std::time::Instant::now();
     let out = run(
         {
             let mut cmd = git(workdir);
-            cmd.args(["status", "--porcelain", "-z", "--untracked-files=all"]);
+            cmd.args(["status", "--porcelain", "-z", "--untracked-files=normal"]);
             cmd
         },
         "status",
@@ -165,6 +176,10 @@ fn untracked_files(workdir: &Path) -> Result<Vec<FileDiff>> {
     let mut inlined_bytes: u64 = 0;
     for (x, y, path) in parse_status_z(&out) {
         if x != '?' || y != '?' {
+            continue;
+        }
+        if let Some(dir) = path.strip_suffix('/') {
+            files.push(untracked_dir_stub(dir));
             continue;
         }
         let over_budget =
@@ -179,10 +194,60 @@ fn untracked_files(workdir: &Path) -> Result<Vec<FileDiff>> {
         files.push(file);
     }
     crate::app::debug_log(&format!(
-        "cli phase: untracked contents {:?} ({} files)",
+        "cli phase: untracked contents {:?} ({} entries)",
         t.elapsed(),
         files.len()
     ));
+    Ok(files)
+}
+
+fn untracked_dir_stub(dir: &str) -> FileDiff {
+    FileDiff {
+        path: dir.to_string(),
+        old_path: None,
+        status: FileStatus::Added,
+        binary: false,
+        large: false,
+        byte_size: 0,
+        untracked_dir: true,
+        hunks: Vec::new(),
+        additions: 0,
+        deletions: 0,
+    }
+}
+
+/// Expand a collapsed untracked directory: list its files (scoped scan is
+/// cheap) and inline their contents under the usual budget.
+pub fn load_untracked_dir(workdir: &Path, dir: &str) -> Result<Vec<FileDiff>> {
+    let out = run(
+        {
+            let mut cmd = git(workdir);
+            cmd.args(["status", "--porcelain", "-z", "--untracked-files=all", "--"])
+                .arg(dir);
+            cmd
+        },
+        "status",
+    )?;
+    let mut files = Vec::new();
+    let mut inlined_bytes: u64 = 0;
+    for (x, y, path) in parse_status_z(&out) {
+        if x != '?' || y != '?' {
+            continue;
+        }
+        let over_budget =
+            files.len() >= UNTRACKED_INLINE_MAX_FILES || inlined_bytes > UNTRACKED_INLINE_MAX_BYTES;
+        let cap = if over_budget {
+            0
+        } else {
+            MAX_CONTENT_FILE_SIZE as u64
+        };
+        let file = untracked_file(workdir, &path, cap)?;
+        inlined_bytes += if file.large { 0 } else { file.byte_size };
+        files.push(file);
+    }
+    if files.is_empty() {
+        anyhow::bail!("no untracked files under '{dir}'");
+    }
     Ok(files)
 }
 
@@ -196,6 +261,7 @@ fn untracked_file(workdir: &Path, path: &str, cap: u64) -> Result<FileDiff> {
         binary: false,
         large: byte_size > cap,
         byte_size,
+        untracked_dir: false,
         hunks: Vec::new(),
         additions: 0,
         deletions: 0,
@@ -271,6 +337,7 @@ pub fn parse_patch(text: &str) -> Vec<FileDiff> {
                 binary: false,
                 large: false,
                 byte_size: 0,
+                untracked_dir: false,
                 hunks: Vec::new(),
                 additions: 0,
                 deletions: 0,

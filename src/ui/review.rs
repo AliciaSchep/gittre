@@ -110,7 +110,7 @@ impl Stream {
                     push_comment(&mut rows, &mut comment_starts, ci, true);
                 }
             }
-            if file.large && file.hunks.is_empty() {
+            if file.untracked_dir || (file.large && file.hunks.is_empty()) {
                 rows.push(Row::LargeStub(fi));
                 continue;
             }
@@ -709,11 +709,20 @@ impl Stream {
             }
             Row::Binary => Line::from("   (binary file changed)".dark_gray().italic()),
             Row::LargeStub(fi) => {
-                let size = files[fi].byte_size;
+                let f = &files[fi];
+                let label = if f.untracked_dir {
+                    "untracked directory — contents not listed".to_string()
+                } else {
+                    format!("large file ({}) — diff not loaded", human_size(f.byte_size))
+                };
                 Line::from(vec![
                     "   ▶ ".cyan(),
-                    format!("large file ({}) — diff not loaded", human_size(size)).italic(),
-                    "  [⏎ load]".bold().cyan(),
+                    label.italic(),
+                    if f.untracked_dir {
+                        "  [⏎ list]".bold().cyan()
+                    } else {
+                        "  [⏎ load]".bold().cyan()
+                    },
                 ])
             }
             Row::CommentHeader(ci) => {
@@ -802,6 +811,7 @@ mod tests {
             binary: false,
             large: false,
             byte_size: 0,
+            untracked_dir: false,
             hunks: vec![Hunk {
                 header: "@@ @@".into(),
                 lines: (0..lines)
