@@ -68,6 +68,19 @@ src/ui/{picker,fileview,bar,popups,highlight}.rs
   This also means users can fix slow repos with
   `git config core.fsmonitor true` + `core.untrackedCache true` — gittre
   inherits it.
+- **Every git command we run can write `.git/index`** (fsmonitor token, stat
+  refresh) — the watcher would see that as a repo change and reload, whose
+  status writes the index again: a feedback loop (measured: 25 reloads in
+  12 idle seconds). `ignore_events_until` in App suppresses watcher events
+  for 700ms after ANY load response; if you add a new git-running code path,
+  its completion must arm that window too, or the loop returns.
+- **Untracked scanning uses `--untracked-files=normal`, never `-uall`** for
+  the full scan: normal is the only mode git's untracked cache accelerates,
+  and it collapses fully-untracked directories into single expandable stubs
+  (`Enter` runs a cheap scoped `-uall` on just that dir). Inline-content
+  budgets (200 files / 4MB) bound the file reads.
+- **Independent git commands run concurrently** (`git diff` ∥ untracked scan
+  in cli.rs): a load costs max(), not sum. Preserve that when adding phases.
 - Rename detection is skipped above `RENAME_DETECTION_LIMIT` changed files;
   `--no-watch` + `r` is the escape hatch for repos where reloads are costly
   (a one-time hint suggests it when a reload exceeds 1s).
@@ -100,6 +113,19 @@ chokes on some emoji.
 
 Debugging the live TUI: set `GITTRE_LOG=/tmp/gittre.log` — event traffic
 (reloads, loads with timings) appends there, since the TUI owns the terminal.
+
+**Performance playbook** (from the large-repo work, 2026-07): the target is
+*parity with git itself* — compare `cli phase:` timings in GITTRE_LOG against
+raw `time git diff HEAD` / `time git status` on the same tree. If gittre is
+slower than those, it's our bug; if git itself is slow, the fix is repo-side
+(fsmonitor, untracked cache) and gittre inherits it. A `--depth 1` clone of
+mozilla/gecko-dev (~388k files) is the reference testbed: dirty it with ~30
+modified files + a few hundred untracked in one directory; a healthy
+uncommitted load there is ~2s, bounded by `git status`. Also watch DiffLoaded
+counts during idle — more than one load without user action means a watcher
+feedback loop. And distrust plausible theories without phase timings: an
+early "obvious" stat-cache fix here changed nothing; the measured culprits
+were libgit2 itself and the event loop.
 
 A lesson the harness already encodes: kernel pty buffers are ~16KB, so the
 driver drains the pty on a dedicated thread. If a TUI under test ever seems
