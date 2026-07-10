@@ -61,7 +61,10 @@ Mouse works: wheel scrolls, click jumps. `?` shows everything else.
 the diff. They're anchored to the code *content*, GitHub-style: edit the file
 and they follow the lines they were written on; if the code disappears they
 turn **outdated** — kept, flagged, and shown with the original snippet rather
-than lost. `e` exports all comments to markdown, or headlessly:
+than lost. Saved comments wrap and reflow with the diff pane. The comment
+editor follows the selected line, grows and scrolls as needed, and supports
+normal caret navigation; Enter saves and Alt+Enter adds a line. `e` previews
+all comments as markdown before you copy or write them, or export headlessly:
 
 ```sh
 gittre export            # markdown to stdout

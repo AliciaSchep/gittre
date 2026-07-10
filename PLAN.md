@@ -6,9 +6,9 @@ does *not* commit, stage, merge, stash, or push. Inspiration:
 keyboard-first) and [hunk](https://github.com/modem-dev/hunk) (review-first
 continuous diff stream, file sidebar, watch mode).
 
-Commenting + markdown export is the planned differentiator but is **deferred**
-— it needs more design thought. Current thinking is parked in §7 so nothing in
-v1 paints us into a corner.
+Commenting + markdown export is the product differentiator: comments persist
+outside the worktree, follow code as it moves, render inline, and can be
+previewed or exported as markdown.
 
 ## 1. Product scope
 
@@ -22,9 +22,6 @@ v1 paints us into a corner.
 - Continuous multi-file diff browsing (scroll through the whole changeset) *and* a file tree to jump to a specific file.
 - Automatic reload when the repo changes (working tree edits, index changes, new commits).
 - On-screen command bar at all times (gitui-style) plus a `?` help popup.
-
-**Deferred (planned, needs more design — see §7)**
-- Line/range comments with persistence across sessions and export to markdown.
 
 **Out of scope (permanently, by design)**
 - Committing, staging/unstaging, amending, merging, rebasing, branching, stashing, pushing/pulling.
@@ -192,6 +189,12 @@ expand" row.
   2. ✅ Re-anchoring engine + outdated handling (GitHub-style).
   3. ✅ Markdown export (`e` popup + headless `gittre export [-o PATH]`).
   4. Polish: `}`/`{` comment navigation ✅; resolve state deferred.
+- **M6 — review UX polish.** ✅ Anchored, wrapping, scrollable comment editor
+  with caret navigation and paste support; saved inline comments reflow with
+  the diff pane; content-aware file tree that grows on wide terminals; exact
+  markdown preview with scrolling, clipboard copy, and an explicit write step.
+  Drag-resizing the tree remains deferred, but pane sizing distinguishes
+  automatic from a future manual width.
 
 Each milestone is shippable; M1–M3 is already a useful daily tool.
 
@@ -203,8 +206,8 @@ Each milestone is shippable; M1–M3 is already a useful daily tool.
   because unified survives narrow terminals (and will simplify comment anchoring
   later).
 - **No pager/difftool integration in v1** (hunk does this); revisit later.
-- Keys `c`, `v`, `e`, `d` are **reserved unbound** in the review screen so
-  commenting can claim them later without breaking habits.
+- Comment editing keeps Enter as save and Alt+Enter as newline because modified
+  Enter keys are not reported consistently across terminal protocols.
 
 ## 7. M5 commenting design (settled)
 
@@ -232,4 +235,5 @@ loss.
 - **Storage:** JSON at `<gitdir>/gittre/comments.json` — never touches the
   working tree; linked worktrees get their own review (separate gitdir).
 - **Export (M5.3):** markdown grouped by file — line refs, fenced snippet,
-  body; outdated flagged. `e` popup for the path; also `gittre export`.
+  body; outdated flagged. `e` opens an exact preview with copy/write actions;
+  also `gittre export`.

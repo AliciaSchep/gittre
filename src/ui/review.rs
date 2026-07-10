@@ -3,12 +3,14 @@ use std::collections::HashMap;
 
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Paragraph};
+use unicode_width::UnicodeWidthChar;
 
 use crate::comments::{Anchor, Comment, Placed};
 use crate::git::diff::{DiffResult, FileDiff, FileStatus};
 use crate::ui::highlight::Highlighter;
 
 /// One renderable row of the concatenated diff stream.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Row {
     Spacer,
     FileHeader(usize),
@@ -21,8 +23,15 @@ enum Row {
     CommentHeader(usize),
     /// One preserved-snippet line of an outdated comment.
     CommentSnippet(usize, usize),
-    /// One body line of a comment: (comment index, body line index).
-    CommentBody(usize, usize),
+    /// A wrapped segment of one comment body line:
+    /// (comment index, logical line, start byte, end byte).
+    CommentBody(usize, usize, usize, usize),
+}
+
+#[derive(Clone, Copy)]
+struct RowOrigin {
+    template: usize,
+    body_offset: usize,
 }
 
 struct SearchState {
@@ -44,7 +53,12 @@ pub struct CommentTarget {
 
 /// The continuous multi-file diff view.
 pub struct Stream {
+    /// Width-independent rows. Comment body rows are expanded from this
+    /// template whenever the diff pane changes width.
+    template_rows: Vec<Row>,
     rows: Vec<Row>,
+    row_origins: Vec<RowOrigin>,
+    comment_wrap_width: usize,
     /// Row index of each file's header, in file order.
     file_starts: Vec<usize>,
     /// Row index of each hunk header, in stream order.
@@ -95,7 +109,8 @@ impl Stream {
                     }
                 }
                 for bi in 0..comments[ci].body.lines().count().max(1) {
-                    rows.push(Row::CommentBody(ci, bi));
+                    let body = comments[ci].body.lines().nth(bi).unwrap_or("");
+                    rows.push(Row::CommentBody(ci, bi, 0, body.len()));
                 }
             };
 
@@ -132,8 +147,19 @@ impl Stream {
             }
         }
 
+        let template_rows = rows;
+        let rows = template_rows.clone();
+        let row_origins = (0..rows.len())
+            .map(|template| RowOrigin {
+                template,
+                body_offset: 0,
+            })
+            .collect();
         Stream {
+            template_rows,
             rows,
+            row_origins,
+            comment_wrap_width: 0,
             file_starts,
             hunk_starts,
             comment_starts,
@@ -190,6 +216,18 @@ impl Stream {
         self.ensure_cursor_visible();
     }
 
+    /// Screen position of the active row after the latest render. Popups use
+    /// this to stay visually attached to the line or comment being edited.
+    pub fn cursor_screen_position(&self) -> Option<Position> {
+        let inner = self.last_inner.get();
+        let offset = self.cursor.checked_sub(self.scroll)? as u16;
+        (offset < inner.height).then(|| Position::new(inner.x.saturating_add(2), inner.y + offset))
+    }
+
+    pub fn viewport_rect(&self) -> Rect {
+        self.last_inner.get()
+    }
+
     // ---- comments ----------------------------------------------------------
 
     pub fn next_comment(&mut self) {
@@ -221,7 +259,7 @@ impl Stream {
         match self.rows.get(self.cursor) {
             Some(Row::CommentHeader(ci))
             | Some(Row::CommentSnippet(ci, _))
-            | Some(Row::CommentBody(ci, _)) => Some(*ci),
+            | Some(Row::CommentBody(ci, _, _, _)) => Some(*ci),
             _ => None,
         }
     }
@@ -539,8 +577,99 @@ impl Stream {
         }
     }
 
+    fn reflow_comments(&mut self, width: u16, comments: &[Comment]) {
+        let width = width.max(1) as usize;
+        if width == self.comment_wrap_width {
+            return;
+        }
+
+        let screen_offset = self.cursor.saturating_sub(self.scroll);
+        let cursor_origin = self.row_origins.get(self.cursor).copied();
+        let selection_origin = self
+            .selection_anchor
+            .and_then(|row| self.row_origins.get(row).copied());
+        let search_origins: Option<Vec<RowOrigin>> = self.search.as_ref().map(|search| {
+            search
+                .matches
+                .iter()
+                .filter_map(|&row| self.row_origins.get(row).copied())
+                .collect()
+        });
+
+        let mut rows = Vec::new();
+        let mut origins = Vec::new();
+        for (template, row) in self.template_rows.iter().copied().enumerate() {
+            match row {
+                Row::CommentBody(ci, bi, _, _) => {
+                    let body = comments[ci].body.lines().nth(bi).unwrap_or("");
+                    for (start, end) in wrap_ranges(body, width) {
+                        rows.push(Row::CommentBody(ci, bi, start, end));
+                        origins.push(RowOrigin {
+                            template,
+                            body_offset: start,
+                        });
+                    }
+                }
+                _ => {
+                    rows.push(row);
+                    origins.push(RowOrigin {
+                        template,
+                        body_offset: 0,
+                    });
+                }
+            }
+        }
+
+        let locate = |origin: RowOrigin| {
+            origins
+                .iter()
+                .enumerate()
+                .filter(|(_, candidate)| {
+                    candidate.template == origin.template
+                        && candidate.body_offset <= origin.body_offset
+                })
+                .map(|(row, _)| row)
+                .next_back()
+        };
+
+        let cursor_row = cursor_origin.and_then(locate);
+        let selection_row = selection_origin.and_then(locate);
+        let search_rows = search_origins
+            .map(|origins| origins.into_iter().filter_map(locate).collect::<Vec<_>>());
+
+        self.rows = rows;
+        self.row_origins = origins;
+        self.comment_wrap_width = width;
+        if let Some(row) = cursor_row {
+            self.cursor = row;
+        }
+        self.selection_anchor = selection_row;
+        if let (Some(search), Some(search_rows)) = (&mut self.search, search_rows) {
+            search.matches = search_rows;
+            search.current = search.current.min(search.matches.len().saturating_sub(1));
+        }
+
+        self.file_starts.clear();
+        self.hunk_starts.clear();
+        self.comment_starts.clear();
+        for (row, item) in self.rows.iter().enumerate() {
+            match item {
+                Row::FileHeader(_) => self.file_starts.push(row),
+                Row::HunkHeader(_, _) => self.hunk_starts.push(row),
+                Row::CommentHeader(_) => self.comment_starts.push(row),
+                _ => {}
+            }
+        }
+        self.cursor = self.clamp_row(self.cursor as isize);
+        self.scroll = self
+            .cursor
+            .saturating_sub(screen_offset)
+            .min(self.scroll_limit());
+        self.ensure_cursor_visible();
+    }
+
     pub fn render(
-        &self,
+        &mut self,
         frame: &mut Frame,
         area: Rect,
         files: &[FileDiff],
@@ -548,6 +677,7 @@ impl Stream {
         focused: bool,
         hl: &Highlighter,
     ) {
+        self.reflow_comments(area.width.saturating_sub(2), comments);
         let border_style = if focused {
             Style::new().cyan()
         } else {
@@ -751,9 +881,10 @@ impl Stream {
                 let text = comments[ci].snippet.get(si).cloned().unwrap_or_default();
                 Line::from(vec!["▐ ".yellow(), text.dark_gray().italic()])
             }
-            Row::CommentBody(ci, bi) => {
+            Row::CommentBody(ci, bi, start, end) => {
                 let body = comments[ci].body.lines().nth(bi).unwrap_or("");
-                Line::from(vec!["▐ ".cyan(), Span::raw(body.to_string())])
+                let text = body.get(start..end).unwrap_or("");
+                Line::from(vec!["▐ ".cyan(), Span::raw(text.to_string())])
             }
             Row::HunkHeader(fi, hi) => Line::from(files[fi].hunks[hi].header.clone().cyan()),
             Row::Line(fi, hi, li) => {
@@ -790,6 +921,27 @@ impl Stream {
     }
 }
 
+fn wrap_ranges(text: &str, width: usize) -> Vec<(usize, usize)> {
+    let width = width.max(1);
+    if text.is_empty() {
+        return vec![(0, 0)];
+    }
+    let mut ranges = Vec::new();
+    let mut start = 0;
+    let mut cells = 0;
+    for (idx, c) in text.char_indices() {
+        let char_width = UnicodeWidthChar::width(c).unwrap_or(0);
+        if cells + char_width > width && idx > start {
+            ranges.push((start, idx));
+            start = idx;
+            cells = 0;
+        }
+        cells += char_width;
+    }
+    ranges.push((start, text.len()));
+    ranges
+}
+
 fn human_size(bytes: u64) -> String {
     if bytes >= 1024 * 1024 {
         format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
@@ -801,6 +953,7 @@ fn human_size(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::comments::Placed;
     use crate::git::diff::{DiffLine, DiffResult, FileDiff, FileStatus, Hunk};
 
     fn file(path: &str, lines: usize) -> FileDiff {
@@ -867,5 +1020,37 @@ mod tests {
         stream.set_viewport(4);
         stream.restore(&anchor, &after.files);
         assert!(stream.scroll < 6, "scroll clamped into the smaller diff");
+    }
+
+    #[test]
+    fn saved_comments_wrap_and_keep_cursor_on_resize() {
+        let diff = diff(&[("a.txt", 1)]);
+        let comments = [Comment {
+            id: 1,
+            path: "a.txt".into(),
+            new_side: true,
+            lines: (1, 1),
+            snippet: vec!["+line 0".into()],
+            body: "a deliberately long saved comment".into(),
+            created_at: 0,
+            scope: "test".into(),
+            outdated: false,
+        }];
+        let placed = [Placed {
+            comment: 0,
+            file: 0,
+            anchor: Anchor::Line { hunk: 0, line: 0 },
+        }];
+        let mut stream = Stream::new(&diff, &placed, &comments);
+
+        stream.reflow_comments(10, &comments);
+        assert_eq!(stream.comment_starts, [3]);
+        assert_eq!(stream.rows.len(), 8, "body expands to four visual rows");
+        stream.cursor = 5;
+        assert_eq!(stream.comment_at_cursor(), Some(0));
+
+        stream.reflow_comments(20, &comments);
+        assert_eq!(stream.comment_at_cursor(), Some(0));
+        assert_eq!(stream.rows.len(), 6, "body reflows to two visual rows");
     }
 }

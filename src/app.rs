@@ -20,7 +20,7 @@ use crate::ui::highlight::Highlighter;
 use crate::ui::picker::{BasePicker, LogPicker, ScopeAction, ScopeItem, ScopePicker, count_label};
 use crate::ui::review::{CommentTarget, Stream};
 use crate::ui::tree::FileTree;
-use crate::ui::{bar, popups};
+use crate::ui::{bar, editor::TextEditor, export::ExportPreview, popups};
 use crate::watch::{self, RepoWatcher};
 
 #[derive(PartialEq, Clone, Copy)]
@@ -36,6 +36,9 @@ struct ReviewState {
     tree: FileTree,
     focus: Focus,
     show_tree: bool,
+    /// None is content-aware automatic sizing. A future drag gesture can set
+    /// a manual width without changing the pane-layout contract.
+    tree_width: Option<u16>,
     /// Full-file pager overlay (`o`).
     file_view: Option<FileView>,
 }
@@ -52,6 +55,7 @@ impl ReviewState {
             tree,
             focus: Focus::Stream,
             show_tree: true,
+            tree_width: None,
             file_view: None,
         }
     }
@@ -81,6 +85,8 @@ pub struct App {
     search_input: Option<String>,
     /// Output path being typed for markdown export.
     export_input: Option<String>,
+    /// Exact Markdown preview shown before an interactive export is written.
+    export_preview: Option<ExportPreview>,
     /// Transient confirmation shown in the title bar (e.g. "copied 12 lines").
     notice: Option<String>,
     /// $EDITOR launch requested by `E`; handled in the run loop where the
@@ -103,15 +109,13 @@ pub struct App {
 }
 
 struct CommentDraft {
-    body: String,
+    editor: TextEditor,
     /// Some(id) when editing an existing comment.
     editing: Option<u64>,
     /// None when editing (anchor is kept from the original).
     target: Option<CommentTarget>,
     label: String,
 }
-
-const TREE_WIDTH: u16 = 32;
 
 /// Append a line to $GITTRE_LOG if set — the TUI owns the terminal, so
 /// debugging goes to a file.
@@ -160,6 +164,7 @@ impl App {
             reloaded_at: None,
             search_input: None,
             export_input: None,
+            export_preview: None,
             notice: None,
             pending_editor: None,
             highlighter: Highlighter::new(),
@@ -191,6 +196,7 @@ impl App {
                         self.on_key(key.code, key.modifiers);
                     }
                     Event::Mouse(mouse) => self.on_mouse(mouse),
+                    Event::Paste(text) => self.on_paste(&text),
                     _ => {}
                 }
             }
@@ -207,7 +213,9 @@ impl App {
     /// Suspend the TUI, run $EDITOR at file:line, resume. Any edits the
     /// editor saves are picked up by the auto-reload watcher.
     fn run_editor(&mut self, terminal: &mut DefaultTerminal, path: &std::path::Path, line: usize) {
-        use ratatui::crossterm::event::{DisableMouseCapture, EnableMouseCapture};
+        use ratatui::crossterm::event::{
+            DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        };
         use ratatui::crossterm::execute;
         use ratatui::crossterm::terminal::{
             EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -224,7 +232,12 @@ impl App {
         };
         let args: Vec<&str> = parts.collect();
 
-        let _ = execute!(std::io::stdout(), LeaveAlternateScreen, DisableMouseCapture);
+        let _ = execute!(
+            std::io::stdout(),
+            LeaveAlternateScreen,
+            DisableMouseCapture,
+            DisableBracketedPaste
+        );
         let _ = disable_raw_mode();
         let status = std::process::Command::new(program)
             .args(&args)
@@ -232,7 +245,12 @@ impl App {
             .arg(path)
             .status();
         let _ = enable_raw_mode();
-        let _ = execute!(std::io::stdout(), EnterAlternateScreen, EnableMouseCapture);
+        let _ = execute!(
+            std::io::stdout(),
+            EnterAlternateScreen,
+            EnableMouseCapture,
+            EnableBracketedPaste
+        );
         let _ = terminal.clear();
 
         match status {
@@ -244,11 +262,44 @@ impl App {
 
     fn on_mouse(&mut self, mouse: MouseEvent) {
         let (col, row) = (mouse.column, mouse.row);
+        if let Some(draft) = &mut self.comment_draft {
+            match mouse.kind {
+                MouseEventKind::ScrollDown => draft.editor.scroll_by(3),
+                MouseEventKind::ScrollUp => draft.editor.scroll_by(-3),
+                MouseEventKind::Down(MouseButton::Left) => {
+                    draft.editor.set_cursor_from_screen(col, row)
+                }
+                _ => {}
+            }
+            return;
+        }
+        if self.export_input.is_some() {
+            return;
+        }
+        if let Some(preview) = &mut self.export_preview {
+            match mouse.kind {
+                MouseEventKind::ScrollDown => preview.scroll_by(3),
+                MouseEventKind::ScrollUp => preview.scroll_by(-3),
+                MouseEventKind::Down(MouseButton::Left) => {}
+                _ => {}
+            }
+            return;
+        }
         match mouse.kind {
             MouseEventKind::ScrollDown => self.mouse_scroll(1, col, row),
             MouseEventKind::ScrollUp => self.mouse_scroll(-1, col, row),
             MouseEventKind::Down(MouseButton::Left) => self.mouse_click(col, row),
             _ => {}
+        }
+    }
+
+    fn on_paste(&mut self, text: &str) {
+        if let Some(draft) = &mut self.comment_draft {
+            draft.editor.insert_str(text);
+        } else if let Some(path) = &mut self.export_input {
+            path.push_str(&text.replace(['\r', '\n'], ""));
+        } else if let Some(query) = &mut self.search_input {
+            query.push_str(&text.replace(['\r', '\n'], ""));
         }
     }
 
@@ -477,6 +528,10 @@ impl App {
             ),
         }
 
+        if let Some(preview) = &mut self.export_preview {
+            preview.render(frame, main_area, self.store.comments.len());
+        }
+
         if let Some(query) = &self.search_input {
             bar::render_input(frame, bar_area, "/", query, "search");
         } else if let Some(path) = &self.export_input {
@@ -485,8 +540,21 @@ impl App {
             bar::render(frame, bar_area, &self.hints());
         }
 
-        if let Some(draft) = &self.comment_draft {
-            popups::render_comment_editor(frame, frame.area(), &draft.label, &draft.body);
+        let (comment_bounds, comment_anchor) = match &self.screen {
+            Screen::Review(review) => (
+                review.stream.viewport_rect(),
+                review.stream.cursor_screen_position(),
+            ),
+            _ => (main_area, None),
+        };
+        if let Some(draft) = &mut self.comment_draft {
+            popups::render_comment_editor(
+                frame,
+                comment_bounds,
+                comment_anchor,
+                &draft.label,
+                &mut draft.editor,
+            );
         }
         if self.confirm_clear {
             let n = self.store.comments.len();
@@ -543,7 +611,12 @@ impl App {
             return vec![("q/Esc/?", "close help")];
         }
         if self.comment_draft.is_some() {
-            return vec![("⏎", "save"), ("Alt+⏎", "newline"), ("Esc", "cancel")];
+            return vec![
+                ("←↑↓→", "move"),
+                ("⏎", "save"),
+                ("Alt+⏎", "newline"),
+                ("Esc", "cancel"),
+            ];
         }
         if self.confirm_clear {
             return vec![("y", "delete all comments"), ("any key", "cancel")];
@@ -553,6 +626,15 @@ impl App {
         }
         if self.export_input.is_some() {
             return vec![("⏎", "write file"), ("Esc", "cancel")];
+        }
+        if self.export_preview.is_some() {
+            return vec![
+                ("↑↓/jk", "scroll"),
+                ("g/G", "top/bottom"),
+                ("y", "copy markdown"),
+                ("w/⏎", "write file"),
+                ("Esc", "close"),
+            ];
         }
         match &self.screen {
             Screen::Picker(picker) => vec![
@@ -699,6 +781,10 @@ impl App {
             self.on_export_input_key(code);
             return;
         }
+        if self.export_preview.is_some() {
+            self.on_export_preview_key(code, modifiers);
+            return;
+        }
         if code == KeyCode::Char('?') {
             self.show_help = true;
             return;
@@ -718,30 +804,36 @@ impl App {
         };
         match code {
             KeyCode::Esc => self.comment_draft = None,
-            KeyCode::Backspace => {
-                draft.body.pop();
+            KeyCode::Backspace => draft.editor.backspace(),
+            KeyCode::Delete => draft.editor.delete(),
+            KeyCode::Left => draft.editor.move_left(),
+            KeyCode::Right => draft.editor.move_right(),
+            KeyCode::Up => draft.editor.move_vertical(-1),
+            KeyCode::Down => draft.editor.move_vertical(1),
+            KeyCode::Home => draft.editor.home(),
+            KeyCode::End => draft.editor.end(),
+            KeyCode::PageUp => draft.editor.move_vertical(-10),
+            KeyCode::PageDown => draft.editor.move_vertical(10),
+            KeyCode::Enter if modifiers.contains(KeyModifiers::ALT) => {
+                draft.editor.insert_char('\n')
             }
-            KeyCode::Enter if modifiers.contains(KeyModifiers::ALT) => draft.body.push('\n'),
             KeyCode::Enter => {
                 let draft = self.comment_draft.take().unwrap();
-                if draft.body.trim().is_empty() {
+                if draft.editor.as_str().trim().is_empty() {
                     self.notice = Some("empty comment discarded".into());
                     return;
                 }
+                let body = draft.editor.into_string();
                 let scope_label = match &self.screen {
                     Screen::Review(r) => r.scope.label(),
                     _ => String::new(),
                 };
                 let result = match (draft.editing, draft.target) {
-                    (Some(id), _) => self.store.edit(id, draft.body),
-                    (None, Some(t)) => self.store.add(
-                        t.path,
-                        t.new_side,
-                        t.lines,
-                        t.snippet,
-                        draft.body,
-                        scope_label,
-                    ),
+                    (Some(id), _) => self.store.edit(id, body),
+                    (None, Some(t)) => {
+                        self.store
+                            .add(t.path, t.new_side, t.lines, t.snippet, body, scope_label)
+                    }
                     (None, None) => Ok(()),
                 };
                 if let Err(e) = result {
@@ -749,7 +841,7 @@ impl App {
                 }
                 self.rebuild_review();
             }
-            KeyCode::Char(c) => draft.body.push(c),
+            KeyCode::Char(c) => draft.editor.insert_char(c),
             _ => {}
         }
     }
@@ -788,17 +880,25 @@ impl App {
                 input.pop();
             }
             KeyCode::Enter => {
-                let path = self.export_input.take().unwrap_or_default();
+                let path = self.export_input.clone().unwrap_or_default();
                 if path.trim().is_empty() {
                     return;
                 }
-                let md = export_markdown(
-                    &self.store.comments,
-                    &repo_title(&self.repo),
-                    &today_string(),
-                );
+                let md = self
+                    .export_preview
+                    .as_ref()
+                    .map(|preview| preview.markdown().to_string())
+                    .unwrap_or_else(|| {
+                        export_markdown(
+                            &self.store.comments,
+                            &repo_title(&self.repo),
+                            &today_string(),
+                        )
+                    });
                 match std::fs::write(&path, md) {
                     Ok(()) => {
+                        self.export_input = None;
+                        self.export_preview = None;
                         self.notice = Some(format!(
                             "exported {} comment{} to {path}",
                             self.store.comments.len(),
@@ -813,6 +913,36 @@ impl App {
                 }
             }
             KeyCode::Char(c) => input.push(c),
+            _ => {}
+        }
+    }
+
+    fn on_export_preview_key(&mut self, code: KeyCode, modifiers: KeyModifiers) {
+        let Some(preview) = &mut self.export_preview else {
+            return;
+        };
+        match code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('e') => self.export_preview = None,
+            KeyCode::Char('j') | KeyCode::Down => preview.scroll_by(1),
+            KeyCode::Char('k') | KeyCode::Up => preview.scroll_by(-1),
+            KeyCode::PageDown => preview.page(1),
+            KeyCode::PageUp => preview.page(-1),
+            KeyCode::Char('d') if modifiers.contains(KeyModifiers::CONTROL) => preview.page(1),
+            KeyCode::Char('u') if modifiers.contains(KeyModifiers::CONTROL) => preview.page(-1),
+            KeyCode::Char('g') | KeyCode::Home => preview.top(),
+            KeyCode::Char('G') | KeyCode::End => preview.bottom(),
+            KeyCode::Char('w') | KeyCode::Enter => {
+                self.export_input = Some(format!("review-{}.md", today_string()));
+            }
+            KeyCode::Char('y') => {
+                let markdown = preview.markdown().to_string();
+                match arboard::Clipboard::new()
+                    .and_then(|mut clipboard| clipboard.set_text(markdown))
+                {
+                    Ok(()) => self.notice = Some("copied export markdown".into()),
+                    Err(e) => self.error = Some(format!("clipboard: {e}")),
+                }
+            }
             _ => {}
         }
     }
@@ -1003,7 +1133,7 @@ impl App {
                 if let Some(t) = review.stream.selection_target(&review.diff.files) {
                     review.stream.cancel_selection();
                     self.comment_draft = Some(CommentDraft {
-                        body: String::new(),
+                        editor: TextEditor::new(String::new()),
                         editing: None,
                         label: target_label(&t),
                         target: Some(t),
@@ -1035,21 +1165,26 @@ impl App {
                 if self.store.comments.is_empty() {
                     self.error = Some("no comments to export".into());
                 } else {
-                    self.export_input = Some(format!("review-{}.md", today_string()));
+                    let markdown = export_markdown(
+                        &self.store.comments,
+                        &repo_title(&self.repo),
+                        &today_string(),
+                    );
+                    self.export_preview = Some(ExportPreview::new(markdown));
                 }
             }
             KeyCode::Char('c') => {
                 if let Some(ci) = review.stream.comment_at_cursor() {
                     let c = &self.store.comments[ci];
                     self.comment_draft = Some(CommentDraft {
-                        body: c.body.clone(),
+                        editor: TextEditor::new(c.body.clone()),
                         editing: Some(c.id),
                         target: None,
                         label: format!("edit #{} on {}", c.id, c.path),
                     });
                 } else if let Some(t) = review.stream.line_target(&review.diff.files) {
                     self.comment_draft = Some(CommentDraft {
-                        body: String::new(),
+                        editor: TextEditor::new(String::new()),
                         editing: None,
                         label: target_label(&t),
                         target: Some(t),
@@ -1383,11 +1518,9 @@ fn draw_review(
     }
 
     if review.show_tree {
-        let [tree_area, stream_area] = Layout::horizontal([
-            Constraint::Length(TREE_WIDTH.min(area.width / 3)),
-            Constraint::Min(0),
-        ])
-        .areas(area);
+        let tree_width = review_tree_width(review, area.width);
+        let [tree_area, stream_area] =
+            Layout::horizontal([Constraint::Length(tree_width), Constraint::Min(0)]).areas(area);
         review
             .tree
             .render(frame, tree_area, review.focus == Focus::Tree);
@@ -1404,6 +1537,22 @@ fn draw_review(
             .stream
             .render(frame, area, &review.diff.files, comments, true, hl);
     }
+}
+
+fn review_tree_width(review: &ReviewState, available: u16) -> u16 {
+    adaptive_tree_width(review.tree.preferred_width(), review.tree_width, available)
+}
+
+fn adaptive_tree_width(preferred: u16, manual: Option<u16>, available: u16) -> u16 {
+    let fraction_cap = if available < 120 {
+        available / 3
+    } else {
+        available.saturating_mul(2) / 5
+    };
+    let diff_cap = available.saturating_sub(60);
+    let max_width = 72.min(fraction_cap).min(diff_cap.max(1));
+    let desired = manual.unwrap_or(preferred).max(26);
+    desired.min(max_width)
 }
 
 /// Swap in a freshly loaded diff, preserving the reader's position (by file
@@ -1444,5 +1593,23 @@ fn sync_tree(review: &mut ReviewState) {
     }
     if let Some(fi) = review.stream.current_file() {
         review.tree.select_file(fi);
+    }
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::adaptive_tree_width;
+
+    #[test]
+    fn tree_grows_on_wide_screens_but_preserves_diff_space() {
+        assert_eq!(adaptive_tree_width(80, None, 90), 30);
+        assert_eq!(adaptive_tree_width(80, None, 160), 64);
+        assert_eq!(adaptive_tree_width(100, None, 240), 72);
+    }
+
+    #[test]
+    fn short_trees_do_not_waste_wide_screen_space() {
+        assert_eq!(adaptive_tree_width(18, None, 200), 26);
+        assert_eq!(adaptive_tree_width(18, Some(55), 200), 55);
     }
 }

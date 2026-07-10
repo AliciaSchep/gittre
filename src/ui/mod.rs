@@ -1,4 +1,6 @@
 pub mod bar;
+pub mod editor;
+pub mod export;
 pub mod fileview;
 pub mod highlight;
 pub mod picker;

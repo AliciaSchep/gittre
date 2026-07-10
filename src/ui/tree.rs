@@ -2,6 +2,7 @@ use std::cell::Cell;
 
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState};
+use unicode_width::UnicodeWidthStr;
 
 use crate::git::diff::{FileDiff, FileStatus};
 
@@ -108,6 +109,26 @@ impl FileTree {
 
     pub fn len(&self) -> usize {
         self.visible().len()
+    }
+
+    /// Width needed to show the widest visible row without clipping,
+    /// including indentation, status/arrow, comment count, and border.
+    pub fn preferred_width(&self) -> u16 {
+        self.visible()
+            .iter()
+            .map(|row| {
+                let prefix = row.depth * 2 + 2;
+                let comments = if row.node.comments > 0 {
+                    3 + row.node.comments.to_string().len()
+                } else {
+                    0
+                };
+                prefix + UnicodeWidthStr::width(row.node.name.as_str()) + comments + 1
+            })
+            .max()
+            .unwrap_or(18)
+            .max(18)
+            .min(u16::MAX as usize) as u16
     }
 
     pub fn move_selection(&mut self, delta: isize) {

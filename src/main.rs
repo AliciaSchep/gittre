@@ -125,7 +125,8 @@ fn main() -> Result<()> {
     let mut terminal = ratatui::init();
     let _ = ratatui::crossterm::execute!(
         std::io::stdout(),
-        ratatui::crossterm::event::EnableMouseCapture
+        ratatui::crossterm::event::EnableMouseCapture,
+        ratatui::crossterm::event::EnableBracketedPaste
     );
     // ratatui's panic hook restores the terminal but doesn't know about
     // mouse capture; chain our own so a panic doesn't leave it enabled.
@@ -133,14 +134,16 @@ fn main() -> Result<()> {
     std::panic::set_hook(Box::new(move |info| {
         let _ = ratatui::crossterm::execute!(
             std::io::stdout(),
-            ratatui::crossterm::event::DisableMouseCapture
+            ratatui::crossterm::event::DisableMouseCapture,
+            ratatui::crossterm::event::DisableBracketedPaste
         );
         prev_hook(info);
     }));
     let result = app::App::new(repo, initial, !args.no_watch).run(&mut terminal);
     let _ = ratatui::crossterm::execute!(
         std::io::stdout(),
-        ratatui::crossterm::event::DisableMouseCapture
+        ratatui::crossterm::event::DisableMouseCapture,
+        ratatui::crossterm::event::DisableBracketedPaste
     );
     ratatui::restore();
     result
