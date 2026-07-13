@@ -2,6 +2,7 @@ mod app;
 mod comments;
 mod event;
 mod git;
+mod keymap;
 mod ui;
 mod watch;
 

@@ -1,46 +1,44 @@
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, BorderType, Clear, Paragraph};
 
+use crate::keymap::{self, Action, HelpItem};
 use crate::ui::editor::TextEditor;
 
-const HELP: &[(&str, &str)] = &[
-    ("1-9", "picker: open that entry"),
-    ("↑↓ / j k", "scroll diff (or move in a list)"),
-    ("PgUp PgDn / ⌃u ⌃d", "scroll a page"),
-    ("g / G", "jump to top / bottom"),
-    ("] / [", "next / previous file"),
-    ("n / p", "next / previous hunk"),
-    ("/", "search the diff"),
-    ("n / N", "next / previous match while a search is live"),
-    ("v", "select lines; then y copies code, Y copies a patch"),
-    ("o", "view the full file (read-only, at the current line)"),
-    ("E", "open the file in $EDITOR at the current line"),
-    ("c", "comment on the current line (or selection / edit)"),
-    ("←↑↓→ / Home End", "move the caret while editing a comment"),
-    ("⏎ / Alt+⏎", "save comment / insert newline"),
-    ("} / {", "next / previous comment"),
-    ("d / D", "delete the comment at the cursor / ALL comments"),
-    ("e", "preview comment export (then copy or write markdown)"),
-    ("Tab", "pick a file from the tree (Esc cancels)"),
-    ("⏎", "open the selected file / entry"),
-    ("t", "show / hide the file tree"),
-    (
-        "r",
-        "reload the diff now (always available; see --no-watch)",
-    ),
-    ("x", "switch scope (back to the picker)"),
-    ("?", "toggle this help"),
-    ("q / Esc", "back; quits from the picker"),
-    ("⌃c", "quit from anywhere"),
-    (
-        "mouse",
-        "wheel scrolls; click picks (shift+drag to select text)",
-    ),
-];
+/// The `?` popup: sections and descriptions come from `keymap::HELP`; the
+/// keys themselves are derived from the binding tables so they never drift.
+/// Scrolls when it doesn't fit — `scroll` is clamped here, where the height
+/// is known.
+pub fn render_help(frame: &mut Frame, area: Rect, scroll: &mut u16) {
+    let key_label = |item: &HelpItem| match item {
+        HelpItem::Act(actions, _) => keymap::keys_label(keymap::REVIEW, actions),
+        HelpItem::Raw(key, _) => (*key).to_string(),
+    };
+    let key_width = keymap::HELP
+        .iter()
+        .flat_map(|(_, items)| items.iter())
+        .map(|item| key_label(item).chars().count())
+        .max()
+        .unwrap_or(0);
 
-pub fn render_help(frame: &mut Frame, area: Rect) {
-    let width = 64.min(area.width.saturating_sub(4));
-    let height = (HELP.len() as u16 + 4).min(area.height.saturating_sub(2));
+    let mut lines: Vec<Line> = Vec::new();
+    for (si, (title, items)) in keymap::HELP.iter().enumerate() {
+        if si > 0 {
+            lines.push(Line::default());
+        }
+        lines.push(Line::from(format!(" {title}").bold()));
+        for item in *items {
+            let desc = match item {
+                HelpItem::Act(_, desc) | HelpItem::Raw(_, desc) => *desc,
+            };
+            lines.push(Line::from(vec![
+                format!("  {:>key_width$}  ", key_label(item)).bold().cyan(),
+                Span::raw(desc),
+            ]));
+        }
+    }
+
+    let width = 72.min(area.width.saturating_sub(4));
+    let height = (lines.len() as u16 + 2).min(area.height.saturating_sub(2));
     let popup = Rect {
         x: area.x + (area.width.saturating_sub(width)) / 2,
         y: area.y + (area.height.saturating_sub(height)) / 2,
@@ -48,26 +46,23 @@ pub fn render_help(frame: &mut Frame, area: Rect) {
         height,
     };
 
-    let key_width = HELP
-        .iter()
-        .map(|(k, _)| k.chars().count())
-        .max()
-        .unwrap_or(0);
-    let mut lines = vec![Line::default()];
-    for (key, desc) in HELP {
-        lines.push(Line::from(vec![
-            format!("  {key:>key_width$}  ").bold().cyan(),
-            Span::raw(*desc),
-        ]));
-    }
+    let visible = height.saturating_sub(2);
+    let max_scroll = (lines.len() as u16).saturating_sub(visible);
+    *scroll = (*scroll).min(max_scroll);
 
+    let mut block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .title(Line::from(" help ".bold()));
+    if max_scroll > 0 {
+        let nav = keymap::keys_label(keymap::HELP_VIEW, &[Action::Down, Action::Up]);
+        block = block.title_bottom(
+            Line::from(format!(" {nav} scroll ({}/{max_scroll}) ", *scroll).dark_gray())
+                .right_aligned(),
+        );
+    }
     frame.render_widget(Clear, popup);
     frame.render_widget(
-        Paragraph::new(lines).block(
-            Block::bordered()
-                .border_type(BorderType::Rounded)
-                .title(Line::from(" help ".bold())),
-        ),
+        Paragraph::new(lines).scroll((*scroll, 0)).block(block),
         popup,
     );
 }

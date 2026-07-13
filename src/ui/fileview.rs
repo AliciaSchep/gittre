@@ -58,6 +58,10 @@ impl FileView {
         self.scroll_by(direction * self.viewport.get().saturating_sub(1) as isize);
     }
 
+    pub fn half_page(&mut self, direction: isize) {
+        self.scroll_by(direction * (self.viewport.get() / 2).max(1) as isize);
+    }
+
     pub fn scroll_to_top(&mut self) {
         self.scroll = 0;
     }

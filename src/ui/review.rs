@@ -478,6 +478,10 @@ impl Stream {
         self.move_cursor(direction * self.viewport.get().saturating_sub(1) as isize);
     }
 
+    pub fn half_page(&mut self, direction: isize) {
+        self.move_cursor(direction * (self.viewport.get() / 2).max(1) as isize);
+    }
+
     pub fn scroll_to_top(&mut self) {
         self.cursor = 0;
         self.scroll = 0;

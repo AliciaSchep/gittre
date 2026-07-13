@@ -214,6 +214,13 @@ impl CommentStore {
         self.save()
     }
 
+    /// Reinsert comments removed by a delete (the `u` undo). Ids were minted
+    /// by this store and stay unique because next_id never decreases.
+    pub fn restore(&mut self, mut comments: Vec<Comment>) -> Result<()> {
+        self.comments.append(&mut comments);
+        self.save()
+    }
+
     /// Re-anchor all comments against a diff, persisting any moves or
     /// outdated-state changes.
     pub fn reanchor(&mut self, diff: &DiffResult) -> Vec<Placed> {
@@ -478,5 +485,44 @@ mod tests {
         let mut store = reloaded;
         store.delete(1).unwrap();
         assert!(CommentStore::load(&repo).comments.is_empty());
+    }
+
+    #[test]
+    fn restore_after_delete_keeps_id_and_uniqueness() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        let mut store = CommentStore::load(&repo);
+        store
+            .add(
+                "a.rs".into(),
+                true,
+                (3, 5),
+                vec!["+x".into()],
+                "hello".into(),
+                "uncommitted changes".into(),
+            )
+            .unwrap();
+        let deleted = store.comments[0].clone();
+        store.delete(deleted.id).unwrap();
+        store.restore(vec![deleted]).unwrap();
+
+        let reloaded = CommentStore::load(&repo);
+        assert_eq!(reloaded.comments.len(), 1);
+        assert_eq!(reloaded.comments[0].id, 1);
+        assert_eq!(reloaded.comments[0].body, "hello");
+
+        // Ids minted after a restore never collide with the restored one.
+        let mut store = reloaded;
+        store
+            .add(
+                "b.rs".into(),
+                true,
+                (1, 1),
+                vec!["+y".into()],
+                "later".into(),
+                "uncommitted changes".into(),
+            )
+            .unwrap();
+        assert_ne!(store.comments[0].id, store.comments[1].id);
     }
 }

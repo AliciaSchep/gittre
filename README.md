@@ -50,10 +50,12 @@ CLI shortcuts: `gittre -u` (uncommitted) · `-s` (staged) · `-b [base]`
 
 ### Reading
 
-`j`/`k` move the cursor, `]`/`[` next/prev file, `n`/`p` next/prev hunk,
-`/` search (`n`/`N` between matches), `v` select + `y` copy code / `Y` copy
-patch, `o` view the full file, `E` open it in `$EDITOR` at the current line.
-Mouse works: wheel scrolls, click jumps. `?` shows everything else.
+The keys are helix-friendly. `j`/`k` move the cursor (`gg`/`ge` top/bottom,
+`⌃d`/`⌃u` half page), `]`/`[` next/prev file, `n`/`p` next/prev hunk,
+`/` search (`n`/`N` between matches), `v` or `x` select + `y` copy code /
+`Y` copy patch, `o` view the full file, `E` open it in `$EDITOR` at the
+current line. Mouse works: wheel scrolls, click jumps. `?` shows everything
+else.
 
 ### Commenting
 
@@ -63,8 +65,9 @@ and they follow the lines they were written on; if the code disappears they
 turn **outdated** — kept, flagged, and shown with the original snippet rather
 than lost. Saved comments wrap and reflow with the diff pane. The comment
 editor follows the selected line, grows and scrolls as needed, and supports
-normal caret navigation; Enter saves and Alt+Enter adds a line. `e` previews
-all comments as markdown before you copy or write them, or export headlessly:
+normal caret navigation; Enter saves and Alt+Enter adds a line. On a comment,
+`c` edits and `d` deletes (`u` undoes the last delete). `e` previews all
+comments as markdown before you copy or write them, or export headlessly:
 
 ```sh
 gittre export            # markdown to stdout

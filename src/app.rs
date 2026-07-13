@@ -10,11 +10,12 @@ use ratatui::crossterm::event::{
 use ratatui::prelude::*;
 use ratatui::widgets::Paragraph;
 
-use crate::comments::{CommentStore, export_markdown};
+use crate::comments::{Comment, CommentStore, export_markdown};
 use crate::event::{AppEvent, LoadRequest, ScopeCounts, spawn_loader};
 use crate::git::diff::DiffResult;
 use crate::git::log::commit_log;
 use crate::git::scope::{Scope, base_candidates, detect_base, file_content};
+use crate::keymap::{self, Action, KeyPress, Lookup};
 use crate::ui::fileview::FileView;
 use crate::ui::highlight::Highlighter;
 use crate::ui::picker::{BasePicker, LogPicker, ScopeAction, ScopeItem, ScopePicker, count_label};
@@ -98,6 +99,12 @@ pub struct App {
     comment_draft: Option<CommentDraft>,
     /// `D` pressed: waiting for y/n to delete every comment.
     confirm_clear: bool,
+    /// What the last comment delete removed; `u` puts it back.
+    undo_comments: Vec<Comment>,
+    /// First key of a chord (`g`), held until the next key resolves it.
+    pending_key: Option<KeyPress>,
+    /// Scroll offset of the `?` help popup; clamped at render time.
+    help_scroll: u16,
     /// The "reloads are slow, try --no-watch" hint fires at most once.
     slow_hint_shown: bool,
     /// A repo change arrived while a load was in flight; reload once after.
@@ -171,6 +178,9 @@ impl App {
             store,
             comment_draft: None,
             confirm_clear: false,
+            undo_comments: Vec::new(),
+            pending_key: None,
+            help_scroll: 0,
             slow_hint_shown: false,
             reload_queued: false,
             ignore_events_until: None,
@@ -566,7 +576,7 @@ impl App {
             popups::render_confirm(frame, frame.area(), &msg);
         }
         if self.show_help {
-            popups::render_help(frame, frame.area());
+            popups::render_help(frame, frame.area(), &mut self.help_scroll);
         }
     }
 
@@ -606,132 +616,189 @@ impl App {
         frame.render_widget(Paragraph::new(Line::from(spans)), area);
     }
 
-    fn hints(&self) -> Vec<(&'static str, &'static str)> {
+    /// The table whose bindings apply to the next key press.
+    fn active_table(&self) -> &'static [keymap::Binding] {
         if self.show_help {
-            return vec![("q/Esc/?", "close help")];
+            return keymap::HELP_VIEW;
+        }
+        if self.export_preview.is_some() {
+            return keymap::EXPORT_PREVIEW;
+        }
+        match &self.screen {
+            Screen::Picker(_) => keymap::PICKER,
+            Screen::Log(_) => keymap::LOG,
+            Screen::Base(_) => keymap::BASE,
+            Screen::Review(r) if r.file_view.is_some() => keymap::FILE_VIEW,
+            Screen::Review(_) => keymap::REVIEW,
+        }
+    }
+
+    /// Key labels come from the binding tables; only descriptions live here.
+    fn hints(&self) -> Vec<(String, &'static str)> {
+        use Action::*;
+        fn h(
+            table: &[keymap::Binding],
+            actions: &[Action],
+            desc: &'static str,
+        ) -> (String, &'static str) {
+            (keymap::keys_label(table, actions), desc)
+        }
+        fn raw(key: &str, desc: &'static str) -> (String, &'static str) {
+            (key.to_string(), desc)
+        }
+
+        // Mid-chord: show what the held prefix can still complete.
+        if let Some(prefix) = self.pending_key {
+            let mut hints = keymap::chords_from(self.active_table(), prefix);
+            hints.push(raw("other", "cancel"));
+            return hints;
+        }
+        if self.show_help {
+            return vec![
+                h(keymap::HELP_VIEW, &[Down, Up], "scroll"),
+                raw("q/Esc/?", "close help"),
+            ];
         }
         if self.comment_draft.is_some() {
             return vec![
-                ("←↑↓→", "move"),
-                ("⏎", "save"),
-                ("Alt+⏎", "newline"),
-                ("Esc", "cancel"),
+                raw("←↑↓→", "move"),
+                raw("⏎", "save"),
+                raw("Alt+⏎", "newline"),
+                raw("Esc", "cancel"),
             ];
         }
         if self.confirm_clear {
-            return vec![("y", "delete all comments"), ("any key", "cancel")];
+            return vec![raw("y", "delete all comments"), raw("any key", "cancel")];
         }
         if self.search_input.is_some() {
-            return vec![("⏎", "search"), ("Esc", "cancel")];
+            return vec![raw("⏎", "search"), raw("Esc", "cancel")];
         }
         if self.export_input.is_some() {
-            return vec![("⏎", "write file"), ("Esc", "cancel")];
+            return vec![raw("⏎", "write file"), raw("Esc", "cancel")];
         }
         if self.export_preview.is_some() {
+            let t = keymap::EXPORT_PREVIEW;
             return vec![
-                ("↑↓/jk", "scroll"),
-                ("g/G", "top/bottom"),
-                ("y", "copy markdown"),
-                ("w/⏎", "write file"),
-                ("Esc", "close"),
+                h(t, &[Down, Up], "scroll"),
+                h(t, &[GotoTop, GotoBottom], "top/bottom"),
+                h(t, &[CopyMarkdown], "copy markdown"),
+                h(t, &[WriteFile], "write file"),
+                raw("Esc", "close"),
             ];
         }
         match &self.screen {
-            Screen::Picker(picker) => vec![
-                ("1-9", "open"),
-                ("↑↓/jk", "select"),
-                ("⏎", "open"),
-                ("?", "help"),
-                ("q", "quit"),
-            ]
-            .into_iter()
-            .take(if picker.items.is_empty() { 2 } else { 5 })
-            .collect(),
+            Screen::Picker(picker) => {
+                let t = keymap::PICKER;
+                vec![
+                    raw("1-9", "open"),
+                    h(t, &[Down, Up], "select"),
+                    h(t, &[Activate], "open"),
+                    raw("?", "help"),
+                    h(t, &[Quit], "quit"),
+                ]
+                .into_iter()
+                .take(if picker.items.is_empty() { 2 } else { 5 })
+                .collect()
+            }
             Screen::Log(log) => {
+                let t = keymap::LOG;
                 if log.marked.is_some() {
                     vec![
-                        ("↑↓/jk", "select"),
-                        ("⏎", "review marked ⇢ selected"),
-                        ("Space", "unmark"),
-                        ("q/Esc", "back"),
+                        h(t, &[Down, Up], "select"),
+                        h(t, &[Activate], "review marked ⇢ selected"),
+                        h(t, &[MarkRange], "unmark"),
+                        h(t, &[Back], "back"),
                     ]
                 } else {
                     vec![
-                        ("↑↓/jk", "select"),
-                        ("⏎", "review commit"),
-                        ("Space", "mark range start"),
-                        ("q/Esc", "back"),
-                        ("?", "help"),
+                        h(t, &[Down, Up], "select"),
+                        h(t, &[Activate], "review commit"),
+                        h(t, &[MarkRange], "mark range start"),
+                        h(t, &[Back], "back"),
+                        raw("?", "help"),
                     ]
                 }
             }
-            Screen::Base(_) => vec![
-                ("↑↓/jk", "select"),
-                ("⏎", "compare against"),
-                ("q/Esc", "back"),
-                ("?", "help"),
-            ],
+            Screen::Base(_) => {
+                let t = keymap::BASE;
+                vec![
+                    h(t, &[Down, Up], "select"),
+                    h(t, &[Activate], "compare against"),
+                    h(t, &[Back], "back"),
+                    raw("?", "help"),
+                ]
+            }
             Screen::Review(review) => {
+                let t = keymap::REVIEW;
                 if review.diff.files.is_empty() {
-                    return vec![("x/q", "switch scope"), ("?", "help")];
+                    return vec![h(t, &[SwitchScope], "switch scope"), raw("?", "help")];
                 }
                 if review.file_view.is_some() {
+                    let ft = keymap::FILE_VIEW;
                     return vec![
-                        ("↑↓/jk", "scroll"),
-                        ("g/G", "top/bottom"),
-                        ("E", "open in $EDITOR"),
-                        ("q/Esc", "back to diff"),
+                        h(ft, &[Down, Up], "scroll"),
+                        h(ft, &[GotoTop, GotoBottom], "top/bottom"),
+                        h(ft, &[OpenEditor], "open in $EDITOR"),
+                        h(ft, &[Back], "back to diff"),
                     ];
                 }
                 if review.stream.large_stub_at_cursor().is_some() {
                     return vec![
-                        ("⏎", "expand"),
-                        ("↑↓/jk", "scroll"),
-                        ("]/[", "file"),
-                        ("x/q", "scope"),
-                        ("?", "help"),
+                        h(t, &[Activate], "expand"),
+                        h(t, &[Down, Up], "scroll"),
+                        h(t, &[NextFile, PrevFile], "file"),
+                        h(t, &[SwitchScope], "scope"),
+                        raw("?", "help"),
                     ];
                 }
                 if review.stream.has_selection() {
                     return vec![
-                        ("↑↓/jk", "extend"),
-                        ("c", "comment"),
-                        ("y", "copy code"),
-                        ("Y", "copy patch"),
-                        ("Esc/v", "cancel"),
+                        h(t, &[Down, Up], "extend"),
+                        h(t, &[Comment], "comment"),
+                        h(t, &[CopyCode], "copy code"),
+                        h(t, &[CopyPatch], "copy patch"),
+                        raw("Esc/v", "cancel"),
                     ];
                 }
                 if review.focus == Focus::Tree {
                     return vec![
-                        ("↑↓/jk", "select"),
-                        ("⏎", "open"),
-                        ("Esc/Tab", "back to diff"),
-                        ("x/q", "scope"),
-                        ("?", "help"),
+                        h(t, &[Down, Up], "select"),
+                        h(t, &[Activate], "open"),
+                        raw("Esc/Tab", "back to diff"),
+                        h(t, &[SwitchScope], "scope"),
+                        raw("?", "help"),
                     ];
                 }
-                let mut hints: Vec<(&str, &str)> = vec![("↑↓/jk", "scroll"), ("]/[", "file")];
+                let mut hints = vec![
+                    h(t, &[Down, Up], "scroll"),
+                    h(t, &[NextFile, PrevFile], "file"),
+                ];
                 if review.stream.has_search() {
-                    hints.push(("n/N", "match"));
-                    hints.push(("Esc", "clear search"));
+                    hints.push(h(t, &[NextMatch, PrevMatch], "match"));
+                    hints.push(raw("Esc", "clear search"));
                 } else {
-                    hints.push(("n/p", "hunk"));
+                    hints.push(h(t, &[NextHunk, PrevHunk], "hunk"));
                 }
-                hints.push(("/", "search"));
+                hints.push(h(t, &[Search], "search"));
                 if self._watcher.is_none() {
-                    hints.push(("r", "reload"));
+                    hints.push(h(t, &[Reload], "reload"));
                 }
-                hints.push(("c", "comment"));
+                hints.push(h(t, &[Comment], "comment"));
                 if review.stream.has_comments() {
-                    hints.push(("}/{", "comment nav"));
+                    hints.push(h(t, &[NextComment, PrevComment], "comment nav"));
                 }
-                hints.push(("Tab", "pick file"));
-                hints.push(if review.show_tree {
-                    ("t", "hide tree")
-                } else {
-                    ("t", "show tree")
-                });
-                hints.extend([("x/q", "scope"), ("?", "help")]);
+                hints.push(h(t, &[FocusTree], "pick file"));
+                hints.push(h(
+                    t,
+                    &[ToggleTree],
+                    if review.show_tree {
+                        "hide tree"
+                    } else {
+                        "show tree"
+                    },
+                ));
+                hints.push(h(t, &[SwitchScope], "scope"));
+                hints.push(raw("?", "help"));
                 hints
             }
         }
@@ -743,15 +810,16 @@ impl App {
         self.error = None;
         self.notice = None;
 
-        if self.show_help {
-            if matches!(code, KeyCode::Char('q') | KeyCode::Esc | KeyCode::Char('?')) {
-                self.show_help = false;
-            }
-            return;
-        }
         // Raw mode swallows the usual SIGINT, so honor Ctrl-C ourselves.
         if code == KeyCode::Char('c') && modifiers.contains(KeyModifiers::CONTROL) {
             self.quit = true;
+            return;
+        }
+        let key = KeyPress::new(code, modifiers);
+        let pending = self.pending_key.take();
+
+        if self.show_help {
+            self.on_help_key(key, pending);
             return;
         }
         if self.comment_draft.is_some() {
@@ -759,17 +827,15 @@ impl App {
             return;
         }
         if self.confirm_clear {
-            match code {
-                KeyCode::Char('y') | KeyCode::Char('Y') => {
-                    self.confirm_clear = false;
-                    if let Err(e) = self.store.delete_all() {
-                        self.error = Some(format!("{e:#}"));
-                    } else {
-                        self.notice = Some("all comments deleted".into());
-                    }
-                    self.rebuild_review();
+            self.confirm_clear = false;
+            if matches!(code, KeyCode::Char('y') | KeyCode::Char('Y')) {
+                self.undo_comments = self.store.comments.clone();
+                if let Err(e) = self.store.delete_all() {
+                    self.error = Some(format!("{e:#}"));
+                } else {
+                    self.notice = Some("all comments deleted (u restores)".into());
                 }
-                _ => self.confirm_clear = false,
+                self.rebuild_review();
             }
             return;
         }
@@ -782,19 +848,39 @@ impl App {
             return;
         }
         if self.export_preview.is_some() {
-            self.on_export_preview_key(code, modifiers);
+            self.on_export_preview_key(key, pending);
             return;
         }
         if code == KeyCode::Char('?') {
             self.show_help = true;
+            self.help_scroll = 0;
             return;
         }
 
         match &mut self.screen {
-            Screen::Picker(_) => self.on_picker_key(code),
-            Screen::Log(_) => self.on_log_key(code),
-            Screen::Base(_) => self.on_base_key(code),
-            Screen::Review(_) => self.on_review_key(code, modifiers),
+            Screen::Picker(_) => self.on_picker_key(key, pending),
+            Screen::Log(_) => self.on_log_key(key, pending),
+            Screen::Base(_) => self.on_base_key(key, pending),
+            Screen::Review(_) => self.on_review_key(key, pending),
+        }
+    }
+
+    fn on_help_key(&mut self, key: KeyPress, pending: Option<KeyPress>) {
+        match keymap::lookup(keymap::HELP_VIEW, keymap::Ctx::default(), pending, key) {
+            Lookup::Act(action) => match action {
+                Action::Down => self.help_scroll = self.help_scroll.saturating_add(1),
+                Action::Up => self.help_scroll = self.help_scroll.saturating_sub(1),
+                Action::PageDown | Action::HalfPageDown => {
+                    self.help_scroll = self.help_scroll.saturating_add(10)
+                }
+                Action::PageUp | Action::HalfPageUp => {
+                    self.help_scroll = self.help_scroll.saturating_sub(10)
+                }
+                Action::Back => self.show_help = false,
+                _ => {}
+            },
+            Lookup::Pending => self.pending_key = Some(key),
+            Lookup::None => {}
         }
     }
 
@@ -917,33 +1003,37 @@ impl App {
         }
     }
 
-    fn on_export_preview_key(&mut self, code: KeyCode, modifiers: KeyModifiers) {
+    fn on_export_preview_key(&mut self, key: KeyPress, pending: Option<KeyPress>) {
         let Some(preview) = &mut self.export_preview else {
             return;
         };
-        match code {
-            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('e') => self.export_preview = None,
-            KeyCode::Char('j') | KeyCode::Down => preview.scroll_by(1),
-            KeyCode::Char('k') | KeyCode::Up => preview.scroll_by(-1),
-            KeyCode::PageDown => preview.page(1),
-            KeyCode::PageUp => preview.page(-1),
-            KeyCode::Char('d') if modifiers.contains(KeyModifiers::CONTROL) => preview.page(1),
-            KeyCode::Char('u') if modifiers.contains(KeyModifiers::CONTROL) => preview.page(-1),
-            KeyCode::Char('g') | KeyCode::Home => preview.top(),
-            KeyCode::Char('G') | KeyCode::End => preview.bottom(),
-            KeyCode::Char('w') | KeyCode::Enter => {
-                self.export_input = Some(format!("review-{}.md", today_string()));
-            }
-            KeyCode::Char('y') => {
-                let markdown = preview.markdown().to_string();
-                match arboard::Clipboard::new()
-                    .and_then(|mut clipboard| clipboard.set_text(markdown))
-                {
-                    Ok(()) => self.notice = Some("copied export markdown".into()),
-                    Err(e) => self.error = Some(format!("clipboard: {e}")),
+        match keymap::lookup(keymap::EXPORT_PREVIEW, keymap::Ctx::default(), pending, key) {
+            Lookup::Act(action) => match action {
+                Action::Back => self.export_preview = None,
+                Action::Down => preview.scroll_by(1),
+                Action::Up => preview.scroll_by(-1),
+                Action::PageDown => preview.page(1),
+                Action::PageUp => preview.page(-1),
+                Action::HalfPageDown => preview.half_page(1),
+                Action::HalfPageUp => preview.half_page(-1),
+                Action::GotoTop => preview.top(),
+                Action::GotoBottom => preview.bottom(),
+                Action::WriteFile => {
+                    self.export_input = Some(format!("review-{}.md", today_string()));
                 }
-            }
-            _ => {}
+                Action::CopyMarkdown => {
+                    let markdown = preview.markdown().to_string();
+                    match arboard::Clipboard::new()
+                        .and_then(|mut clipboard| clipboard.set_text(markdown))
+                    {
+                        Ok(()) => self.notice = Some("copied export markdown".into()),
+                        Err(e) => self.error = Some(format!("clipboard: {e}")),
+                    }
+                }
+                _ => {}
+            },
+            Lookup::Pending => self.pending_key = Some(key),
+            Lookup::None => {}
         }
     }
 
@@ -976,23 +1066,30 @@ impl App {
         }
     }
 
-    fn on_picker_key(&mut self, code: KeyCode) {
+    fn on_picker_key(&mut self, key: KeyPress, pending: Option<KeyPress>) {
         let Screen::Picker(picker) = &mut self.screen else {
             return;
         };
-        match code {
-            KeyCode::Char('q') | KeyCode::Esc => self.quit = true,
-            KeyCode::Char('j') | KeyCode::Down => picker.move_selection(1),
-            KeyCode::Char('k') | KeyCode::Up => picker.move_selection(-1),
-            KeyCode::Char(c @ '1'..='9') => {
+        if let KeyCode::Char(c @ '1'..='9') = key.code {
+            if key.mods.is_empty() {
                 let idx = c as usize - '1' as usize;
                 if idx < picker.items.len() {
                     picker.selected = idx;
                     self.activate_picker_item();
                 }
+                return;
             }
-            KeyCode::Enter => self.activate_picker_item(),
-            _ => {}
+        }
+        match keymap::lookup(keymap::PICKER, keymap::Ctx::default(), pending, key) {
+            Lookup::Act(action) => match action {
+                Action::Quit => self.quit = true,
+                Action::Down => picker.move_selection(1),
+                Action::Up => picker.move_selection(-1),
+                Action::Activate => self.activate_picker_item(),
+                _ => {}
+            },
+            Lookup::Pending => self.pending_key = Some(key),
+            Lookup::None => {}
         }
     }
 
@@ -1033,20 +1130,26 @@ impl App {
         }
     }
 
-    fn on_base_key(&mut self, code: KeyCode) {
+    fn on_base_key(&mut self, key: KeyPress, pending: Option<KeyPress>) {
         let Screen::Base(base) = &mut self.screen else {
             return;
         };
-        match code {
-            KeyCode::Char('q') | KeyCode::Esc => self.open_picker(),
-            KeyCode::Char('j') | KeyCode::Down => base.move_selection(1),
-            KeyCode::Char('k') | KeyCode::Up => base.move_selection(-1),
-            KeyCode::PageDown => base.move_selection(20),
-            KeyCode::PageUp => base.move_selection(-20),
-            KeyCode::Char('g') | KeyCode::Home => base.selected = 0,
-            KeyCode::Char('G') | KeyCode::End => base.selected = base.names.len().saturating_sub(1),
-            KeyCode::Enter => self.open_selected_base(),
-            _ => {}
+        match keymap::lookup(keymap::BASE, keymap::Ctx::default(), pending, key) {
+            Lookup::Act(action) => match action {
+                Action::Back => self.open_picker(),
+                Action::Down => base.move_selection(1),
+                Action::Up => base.move_selection(-1),
+                Action::PageDown => base.move_selection(20),
+                Action::PageUp => base.move_selection(-20),
+                Action::HalfPageDown => base.move_selection(10),
+                Action::HalfPageUp => base.move_selection(-10),
+                Action::GotoTop => base.selected = 0,
+                Action::GotoBottom => base.selected = base.names.len().saturating_sub(1),
+                Action::Activate => self.open_selected_base(),
+                _ => {}
+            },
+            Lookup::Pending => self.pending_key = Some(key),
+            Lookup::None => {}
         }
     }
 
@@ -1060,21 +1163,27 @@ impl App {
         }
     }
 
-    fn on_log_key(&mut self, code: KeyCode) {
+    fn on_log_key(&mut self, key: KeyPress, pending: Option<KeyPress>) {
         let Screen::Log(log) = &mut self.screen else {
             return;
         };
-        match code {
-            KeyCode::Char('q') | KeyCode::Esc => self.open_picker(),
-            KeyCode::Char('j') | KeyCode::Down => log.move_selection(1),
-            KeyCode::Char('k') | KeyCode::Up => log.move_selection(-1),
-            KeyCode::PageDown => log.move_selection(20),
-            KeyCode::PageUp => log.move_selection(-20),
-            KeyCode::Char('g') | KeyCode::Home => log.selected = 0,
-            KeyCode::Char('G') | KeyCode::End => log.selected = log.entries.len().saturating_sub(1),
-            KeyCode::Char(' ') => log.toggle_mark(),
-            KeyCode::Enter => self.open_selected_commit(),
-            _ => {}
+        match keymap::lookup(keymap::LOG, keymap::Ctx::default(), pending, key) {
+            Lookup::Act(action) => match action {
+                Action::Back => self.open_picker(),
+                Action::Down => log.move_selection(1),
+                Action::Up => log.move_selection(-1),
+                Action::PageDown => log.move_selection(20),
+                Action::PageUp => log.move_selection(-20),
+                Action::HalfPageDown => log.move_selection(10),
+                Action::HalfPageUp => log.move_selection(-10),
+                Action::GotoTop => log.selected = 0,
+                Action::GotoBottom => log.selected = log.entries.len().saturating_sub(1),
+                Action::MarkRange => log.toggle_mark(),
+                Action::Activate => self.open_selected_commit(),
+                _ => {}
+            },
+            Lookup::Pending => self.pending_key = Some(key),
+            Lookup::None => {}
         }
     }
 
@@ -1096,24 +1205,31 @@ impl App {
         self.open_scope(scope);
     }
 
-    fn on_review_key(&mut self, code: KeyCode, modifiers: KeyModifiers) {
+    fn on_review_key(&mut self, key: KeyPress, pending: Option<KeyPress>) {
         let Screen::Review(review) = &mut self.screen else {
             return;
         };
         if let Some(view) = &mut review.file_view {
-            match code {
-                KeyCode::Char('q') | KeyCode::Esc | KeyCode::Char('o') => {
-                    review.file_view = None;
-                }
-                KeyCode::Char('j') | KeyCode::Down => view.scroll_by(1),
-                KeyCode::Char('k') | KeyCode::Up => view.scroll_by(-1),
-                KeyCode::PageDown => view.page(1),
-                KeyCode::PageUp => view.page(-1),
-                KeyCode::Char('d') if modifiers.contains(KeyModifiers::CONTROL) => view.page(1),
-                KeyCode::Char('u') if modifiers.contains(KeyModifiers::CONTROL) => view.page(-1),
-                KeyCode::Char('g') | KeyCode::Home => view.scroll_to_top(),
-                KeyCode::Char('G') | KeyCode::End => view.scroll_to_bottom(),
-                KeyCode::Char('E') => {
+            let action =
+                match keymap::lookup(keymap::FILE_VIEW, keymap::Ctx::default(), pending, key) {
+                    Lookup::Act(action) => action,
+                    Lookup::Pending => {
+                        self.pending_key = Some(key);
+                        return;
+                    }
+                    Lookup::None => return,
+                };
+            match action {
+                Action::Back => review.file_view = None,
+                Action::Down => view.scroll_by(1),
+                Action::Up => view.scroll_by(-1),
+                Action::PageDown => view.page(1),
+                Action::PageUp => view.page(-1),
+                Action::HalfPageDown => view.half_page(1),
+                Action::HalfPageUp => view.half_page(-1),
+                Action::GotoTop => view.scroll_to_top(),
+                Action::GotoBottom => view.scroll_to_bottom(),
+                Action::OpenEditor => {
                     let line = view.top_line();
                     let path = view.path.clone();
                     self.request_editor(&path, line);
@@ -1122,37 +1238,55 @@ impl App {
             }
             return;
         }
-        match code {
-            // Selection-mode actions; all navigation keys fall through and
-            // extend the selection by moving the shared cursor.
-            KeyCode::Esc if review.stream.has_selection() => review.stream.cancel_selection(),
-            KeyCode::Char('v') if review.stream.has_selection() => review.stream.cancel_selection(),
-            KeyCode::Char('y') if review.stream.has_selection() => self.copy_selection(false),
-            KeyCode::Char('Y') if review.stream.has_selection() => self.copy_selection(true),
-            KeyCode::Char('c') if review.stream.has_selection() => {
-                if let Some(t) = review.stream.selection_target(&review.diff.files) {
+        let ctx = keymap::Ctx {
+            search_active: review.stream.has_search(),
+        };
+        let action = match keymap::lookup(keymap::REVIEW, ctx, pending, key) {
+            Lookup::Act(action) => action,
+            Lookup::Pending => {
+                self.pending_key = Some(key);
+                return;
+            }
+            Lookup::None => return,
+        };
+        match action {
+            // Esc peels back one layer at a time:
+            // selection → live search → tree pick → picker.
+            Action::Back => {
+                if review.stream.has_selection() {
                     review.stream.cancel_selection();
-                    self.comment_draft = Some(CommentDraft {
-                        editor: TextEditor::new(String::new()),
-                        editing: None,
-                        label: target_label(&t),
-                        target: Some(t),
-                    });
+                } else if review.stream.has_search() {
+                    review.stream.clear_search();
+                } else if review.focus == Focus::Tree {
+                    review.focus = Focus::Stream;
+                    sync_tree(review);
+                } else {
+                    self.open_picker();
                 }
             }
-            // Esc peels back one layer at a time: live search → tree pick → picker.
-            KeyCode::Esc if review.stream.has_search() => review.stream.clear_search(),
-            KeyCode::Esc if review.focus == Focus::Tree => {
-                review.focus = Focus::Stream;
-                sync_tree(review);
+            Action::SwitchScope => self.open_picker(),
+            Action::Search => self.search_input = Some(String::new()),
+            Action::ToggleSelection => {
+                if review.stream.has_selection() {
+                    review.stream.cancel_selection();
+                } else if review.focus == Focus::Stream {
+                    review.stream.start_selection();
+                }
             }
-            KeyCode::Char('q') | KeyCode::Esc | KeyCode::Char('x') => self.open_picker(),
-            KeyCode::Char('/') => self.search_input = Some(String::new()),
-            KeyCode::Char('v') if review.focus == Focus::Stream => {
-                review.stream.start_selection();
+            // helix's x: select the current line, extend line-wise on repeat.
+            Action::SelectLine => {
+                if review.stream.has_selection() {
+                    review.stream.move_cursor(1);
+                    sync_tree(review);
+                } else if review.focus == Focus::Stream {
+                    review.stream.start_selection();
+                }
             }
-            KeyCode::Char('o') => self.open_file_view(),
-            KeyCode::Char('r') => {
+            Action::CopyCode if review.stream.has_selection() => self.copy_selection(false),
+            Action::CopyPatch if review.stream.has_selection() => self.copy_selection(true),
+            Action::CopyCode | Action::CopyPatch => {}
+            Action::FileView => self.open_file_view(),
+            Action::Reload => {
                 self.seq += 1;
                 self.reloading = true;
                 let scope = review.scope.clone();
@@ -1161,7 +1295,7 @@ impl App {
                     scope,
                 });
             }
-            KeyCode::Char('e') => {
+            Action::ExportPreview => {
                 if self.store.comments.is_empty() {
                     self.error = Some("no comments to export".into());
                 } else {
@@ -1173,8 +1307,16 @@ impl App {
                     self.export_preview = Some(ExportPreview::new(markdown));
                 }
             }
-            KeyCode::Char('c') => {
-                if let Some(ci) = review.stream.comment_at_cursor() {
+            Action::Comment => {
+                if let Some(t) = review.stream.selection_target(&review.diff.files) {
+                    review.stream.cancel_selection();
+                    self.comment_draft = Some(CommentDraft {
+                        editor: TextEditor::new(String::new()),
+                        editing: None,
+                        label: target_label(&t),
+                        target: Some(t),
+                    });
+                } else if let Some(ci) = review.stream.comment_at_cursor() {
                     let c = &self.store.comments[ci];
                     self.comment_draft = Some(CommentDraft {
                         editor: TextEditor::new(c.body.clone()),
@@ -1191,50 +1333,69 @@ impl App {
                     });
                 }
             }
-            KeyCode::Char('d') if !modifiers.contains(KeyModifiers::CONTROL) => {
+            Action::DeleteComment => {
                 if let Some(ci) = review.stream.comment_at_cursor() {
-                    let id = self.store.comments[ci].id;
+                    let comment = self.store.comments[ci].clone();
+                    let id = comment.id;
                     if let Err(e) = self.store.delete(id) {
                         self.error = Some(format!("{e:#}"));
                     } else {
-                        self.notice = Some(format!("deleted comment #{id}"));
+                        self.undo_comments = vec![comment];
+                        self.notice = Some(format!("deleted comment #{id} (u restores)"));
                     }
                     self.rebuild_review();
                 }
             }
-            KeyCode::Char('D') if !self.store.comments.is_empty() => {
-                self.confirm_clear = true;
+            Action::RestoreComments => {
+                if !self.undo_comments.is_empty() {
+                    let comments = std::mem::take(&mut self.undo_comments);
+                    let n = comments.len();
+                    if let Err(e) = self.store.restore(comments) {
+                        self.error = Some(format!("{e:#}"));
+                    } else {
+                        self.notice = Some(format!(
+                            "restored {n} comment{}",
+                            if n == 1 { "" } else { "s" }
+                        ));
+                    }
+                    self.rebuild_review();
+                }
             }
-            KeyCode::Char('}') => {
+            Action::DeleteAllComments => {
+                if !self.store.comments.is_empty() {
+                    self.confirm_clear = true;
+                }
+            }
+            Action::NextComment => {
                 review.stream.next_comment();
                 sync_tree(review);
             }
-            KeyCode::Char('{') => {
+            Action::PrevComment => {
                 review.stream.prev_comment();
                 sync_tree(review);
             }
-            KeyCode::Char('E') => {
+            Action::OpenEditor => {
                 if let Some((fi, line)) = review.stream.current_position(&review.diff.files) {
                     let path = review.diff.files[fi].path.clone();
                     let line = line.unwrap_or(1) as usize;
                     self.request_editor(&path, line);
                 }
             }
-            KeyCode::Char('n') if review.stream.has_search() => {
+            Action::NextMatch => {
                 review.stream.next_match();
                 sync_tree(review);
             }
-            KeyCode::Char('N') if review.stream.has_search() => {
+            Action::PrevMatch => {
                 review.stream.prev_match();
                 sync_tree(review);
             }
-            KeyCode::Char('t') => {
+            Action::ToggleTree => {
                 review.show_tree = !review.show_tree;
                 if !review.show_tree {
                     review.focus = Focus::Stream;
                 }
             }
-            KeyCode::Tab | KeyCode::BackTab => {
+            Action::FocusTree => {
                 if !review.show_tree {
                     review.show_tree = true;
                 }
@@ -1251,61 +1412,61 @@ impl App {
                     sync_tree(review);
                 }
             }
-            KeyCode::Char('j') | KeyCode::Down => match review.focus {
+            Action::Down => match review.focus {
                 Focus::Tree => review.tree.move_selection(1),
                 Focus::Stream => {
                     review.stream.move_cursor(1);
                     sync_tree(review);
                 }
             },
-            KeyCode::Char('k') | KeyCode::Up => match review.focus {
+            Action::Up => match review.focus {
                 Focus::Tree => review.tree.move_selection(-1),
                 Focus::Stream => {
                     review.stream.move_cursor(-1);
                     sync_tree(review);
                 }
             },
-            KeyCode::PageDown => {
+            Action::PageDown => {
                 review.stream.page(1);
                 sync_tree(review);
             }
-            KeyCode::PageUp => {
+            Action::PageUp => {
                 review.stream.page(-1);
                 sync_tree(review);
             }
-            KeyCode::Char('d') if modifiers.contains(KeyModifiers::CONTROL) => {
-                review.stream.page(1);
+            Action::HalfPageDown => {
+                review.stream.half_page(1);
                 sync_tree(review);
             }
-            KeyCode::Char('u') if modifiers.contains(KeyModifiers::CONTROL) => {
-                review.stream.page(-1);
+            Action::HalfPageUp => {
+                review.stream.half_page(-1);
                 sync_tree(review);
             }
-            KeyCode::Char('g') | KeyCode::Home => {
+            Action::GotoTop => {
                 review.stream.scroll_to_top();
                 sync_tree(review);
             }
-            KeyCode::Char('G') | KeyCode::End => {
+            Action::GotoBottom => {
                 review.stream.scroll_to_bottom();
                 sync_tree(review);
             }
-            KeyCode::Char(']') => {
+            Action::NextFile => {
                 review.stream.next_file();
                 sync_tree(review);
             }
-            KeyCode::Char('[') => {
+            Action::PrevFile => {
                 review.stream.prev_file();
                 sync_tree(review);
             }
-            KeyCode::Char('n') => {
+            Action::NextHunk => {
                 review.stream.next_hunk();
                 sync_tree(review);
             }
-            KeyCode::Char('p') => {
+            Action::PrevHunk => {
                 review.stream.prev_hunk();
                 sync_tree(review);
             }
-            KeyCode::Enter => {
+            Action::Activate => {
                 if review.focus == Focus::Tree {
                     if let Some(file_idx) = review.tree.activate() {
                         review.stream.jump_to_file(file_idx);

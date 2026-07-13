@@ -9,9 +9,11 @@ milestone status — **keep PLAN.md current when you change direction**.
 - **Review-only, forever.** No committing, staging, merging, stashing,
   pushing, or file editing (the `$EDITOR` handoff is the sanctioned escape
   hatch). Reject features that mutate the repo.
-- **The command bar teaches the UI.** Any new mode or keybinding must show up
-  in the contextual hints (`App::hints`) and the `?` help popup
-  (`src/ui/popups.rs`), or it doesn't exist.
+- **The command bar teaches the UI.** Every binding lives in the
+  `src/keymap.rs` tables (keys are helix-first: `x` select-line, `gg`/`ge`
+  chords — never rebind them to exits). A new mode or action must appear in
+  the contextual hints (`App::hints`) and the `?` help popup (`keymap::HELP`)
+  — both derive key labels from the tables, or it doesn't exist.
 - **No emoji in the UI.** Cell width is unreliable across terminals (and
   crashes pyte). Use single-width glyphs: ✎ ▐ ⚠ ● ▏.
 
@@ -23,6 +25,8 @@ src/main.rs        clap CLI (flags, a..b ranges, export subcommand), terminal
 src/app.rs         the App state machine: Screen{Picker,Log,Base,Review} +
                    input modes (search/export/comment-draft/confirm) + all
                    key routing. Biggest file; most changes end up here.
+src/keymap.rs      ALL keybindings: per-context tables of key seq -> Action
+                   (chords, guards); hints + help derive labels from these
 src/event.rs       AppEvent channel + background diff-loader thread
 src/watch.rs       notify watcher -> debounced RepoChanged (worktree-aware,
                    git-ignore filtered)

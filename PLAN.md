@@ -67,7 +67,7 @@ Running `gittre` in a repo opens the **scope picker** — a simple menu, no flag
 │                │                                             │
 └────────────────┴─────────────────────────────────────────────┘
  ↑↓/jk scroll  ]/[ file  n/p hunk  ⏎ tree/jump
- t tree  s split  x scope  ? help  q back
+ t tree  s split  q scope  ? help
 ```
 
 - **Right pane: the diff stream.** All changed files concatenated into one
@@ -84,8 +84,25 @@ Running `gittre` in a repo opens the **scope picker** — a simple menu, no flag
   signature pattern). It changes with focus/mode; `?` opens a full help popup.
 - `s` toggles unified ↔ side-by-side (side-by-side only when the terminal is
   wide enough; auto-fall-back to unified like hunk).
-- `x` returns to the scope picker (state for the previous scope is kept).
+- `q` (or `Esc` at the top layer) returns to the scope picker (state for the
+  previous scope is kept). `x` is helix's select-line, not an exit.
 - Large files render lazily; binary files show a one-line "binary file changed" row.
+
+### Keybindings (2026-07: helix-first, one table)
+
+- Bindings target helix muscle memory: `x` selects the current line and
+  extends line-wise on repeat, `gg`/`ge` jump to top/bottom as two-key
+  chords, `⌃d`/`⌃u` half-page, `⌃f`/`⌃b` full page. (`v` select and `/` +
+  `n`/`N` search already matched helix.) Originally `x` exited to the scope
+  picker — the single most hostile binding for a helix user — so exit is
+  `q`/`Esc` only.
+- Every binding lives in `src/keymap.rs`: per-context tables of key sequence
+  → action, with a guard for overloads (`n` is next-match while a search is
+  live, next-hunk otherwise). Dispatch, the command-bar hints, and the `?`
+  help popup all derive their key labels from the tables, so a rebind is a
+  one-line change. A future config file would parse into these same tables.
+- While a chord prefix is held, the command bar lists its completions
+  (`gg top · ge bottom`); any other key cancels the chord.
 
 ## 3. Auto-reload
 
@@ -231,7 +248,8 @@ loss.
   cancels); bare `c` comments the current line. Inline blocks with a colored
   gutter bar; counts in tree + title. `}`/`{` jump between comments; on a
   comment: `c` edits, `d` deletes. `D` deletes **all** comments (confirm
-  prompt) to start a review anew. No resolve state for now (revisit later).
+  prompt) to start a review anew; `u` restores whatever the last delete
+  removed (single or all). No resolve state for now (revisit later).
 - **Storage:** JSON at `<gitdir>/gittre/comments.json` — never touches the
   working tree; linked worktrees get their own review (separate gitdir).
 - **Export (M5.3):** markdown grouped by file — line refs, fenced snippet,

@@ -17,7 +17,7 @@ pub fn render_input(frame: &mut Frame, area: Rect, label: &str, value: &str, act
 }
 
 /// gitui-style contextual command bar: always shows the keys valid right now.
-pub fn render(frame: &mut Frame, area: Rect, hints: &[(&str, &str)]) {
+pub fn render(frame: &mut Frame, area: Rect, hints: &[(String, &str)]) {
     let mut spans: Vec<Span> = Vec::new();
     for (i, (key, label)) in hints.iter().enumerate() {
         if i > 0 {
