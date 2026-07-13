@@ -47,8 +47,9 @@ Running `gittre` in a repo opens the **scope picker** — a simple menu, no flag
 - Counts are computed up front so empty scopes are visibly empty.
 - Option 3 reviews against the **fork point**: the commit right before the
   first commit the branch introduced, found by walking HEAD's history with
-  every *other* branch hidden (remote copies of the branch itself and its
-  upstream don't count — 2026-07 redesign, see §6). Recomputed on every load,
+  every *other* branch hidden (remote copies of the branch itself — same
+  name under any remote — don't count; 2026-07 redesign, see §6). Recomputed
+  on every load,
   so it survives rebases. When no fork point is definable (only branch in
   the repo, detached HEAD), the entry is hidden and option 4's detail says
   why.
@@ -231,8 +232,14 @@ Each milestone is shippable; M1–M3 is already a useful daily tool.
   (upstream = `origin/<same-branch>`) reviewed only *unpushed* commits —
   usually nothing. The fork point (parent of the first commit only this
   branch has, ignoring the branch's own remote copies) matches "review what
-  this branch introduces" regardless of what the trunk is called. Known
-  divergence: after merging the trunk *into* the branch, the merged-in trunk
+  this branch introduces" regardless of what the trunk is called. Remote
+  copies are matched by *name only* — the configured upstream is not
+  exempted, because a branch created with `checkout -b feat origin/main`
+  tracks origin/main, and exempting it from the hide set made the fork
+  point fall back to a stale local main (2026-07 bug fix). Trade-off: a
+  branch pushed under a *different* name and tracked gets its remote copy
+  hidden, shrinking the review to unpushed commits — rare; use `-b` there.
+  Known divergence: after merging the trunk *into* the branch, the merged-in trunk
   changes appear in the diff (merge-base semantics would hide them) — use an
   explicit base for that workflow. Explicit `-b <base>` and the base picker
   keep merge-base semantics; the fork walk is capped at 10k own commits and

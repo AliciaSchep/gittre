@@ -74,14 +74,13 @@ pub fn forkable_branch(repo: &Repository) -> Option<String> {
 }
 
 /// Tips of every branch except `current` and its remote copies (same name
-/// under any remote, or its configured upstream). Pushing your branch must
-/// not make its commits look like they exist elsewhere.
+/// under any remote). Pushing your branch must not make its commits look
+/// like they exist elsewhere. Copies are matched by name only: the
+/// configured upstream is deliberately NOT exempted, because a fresh
+/// `git checkout -b feature origin/main` tracks origin/main — exempting it
+/// made the fork point fall back to a stale local main, dragging the
+/// remote trunk's advance into the review.
 fn other_branch_tips(repo: &Repository, current: &str) -> Vec<Oid> {
-    let upstream = repo
-        .find_branch(current, git2::BranchType::Local)
-        .ok()
-        .and_then(|b| b.upstream().ok())
-        .and_then(|u| u.name().ok().flatten().map(str::to_owned));
     let mut tips = Vec::new();
     for branch_type in [git2::BranchType::Local, git2::BranchType::Remote] {
         let Ok(branches) = repo.branches(Some(branch_type)) else {
@@ -95,7 +94,6 @@ fn other_branch_tips(repo: &Repository, current: &str) -> Vec<Oid> {
                 git2::BranchType::Local => name == current,
                 git2::BranchType::Remote => {
                     name.ends_with("/HEAD")
-                        || Some(name) == upstream.as_deref()
                         || name.split_once('/').is_some_and(|(_, b)| b == current)
                 }
             };

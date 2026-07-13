@@ -501,6 +501,57 @@ mod tests {
     }
 
     #[test]
+    fn fork_scope_ignores_stale_local_trunk_when_branch_tracks_remote_trunk() {
+        let (_dir, repo) = setup();
+        let main_name = repo.head().unwrap().shorthand().unwrap().to_string();
+        let tip = repo.head().unwrap().peel_to_commit().unwrap().id();
+        // origin/<main> exists and has advanced past the stale local trunk.
+        let remote_main = format!("refs/remotes/origin/{main_name}");
+        repo.reference(&remote_main, tip, true, "clone").unwrap();
+        commit_file_on(
+            &repo,
+            &remote_main,
+            "remote.txt",
+            "upstream work\n",
+            "trunk advances on the remote",
+        );
+        // git checkout -b feature origin/<main>: branch off the remote trunk
+        // with it as the configured upstream.
+        let fork = repo
+            .find_reference(&remote_main)
+            .unwrap()
+            .peel_to_commit()
+            .unwrap();
+        repo.branch("feature", &fork, false).unwrap();
+        repo.remote("origin", "https://example.invalid/repo.git")
+            .unwrap();
+        let mut config = repo.config().unwrap();
+        config.set_str("branch.feature.remote", "origin").unwrap();
+        config
+            .set_str("branch.feature.merge", &format!("refs/heads/{main_name}"))
+            .unwrap();
+        commit_file_on(
+            &repo,
+            "refs/heads/feature",
+            "feat.txt",
+            "feature work\n",
+            "feat 1",
+        );
+        repo.set_head("refs/heads/feature").unwrap();
+
+        let scope = Scope::BranchFork {
+            branch: "feature".into(),
+        };
+        let result = load(&repo, &scope).unwrap();
+        assert_eq!(
+            result.files.len(),
+            1,
+            "only the branch's own commit — not the remote trunk's advance over the stale local one"
+        );
+        assert_eq!(find(&result, "feat.txt").status, FileStatus::Added);
+    }
+
+    #[test]
     fn fork_scope_is_empty_for_branch_with_no_own_commits() {
         let (_dir, repo) = setup();
         let head = repo.head().unwrap().peel_to_commit().unwrap();
