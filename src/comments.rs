@@ -62,12 +62,19 @@ pub fn reanchor(diff: &DiffResult, comments: &mut [Comment]) -> (Vec<Placed>, bo
             continue;
         };
         let file = &diff.files[fi];
-        // The anchor line's expected content, from the preserved snippet.
-        let target = comment
+        // Only lines that exist on the comment's chosen side participate in
+        // anchoring. A selection spanning a replacement can preserve both
+        // +/- sides for display while still matching one coherent file view.
+        let target: Vec<String> = comment
             .snippet
-            .last()
-            .map(|l| snippet_text(l))
-            .unwrap_or("");
+            .iter()
+            .filter(|line| match line.chars().next() {
+                Some('+') => comment.new_side,
+                Some('-') => !comment.new_side,
+                _ => true,
+            })
+            .map(|line| snippet_text(line).to_string())
+            .collect();
 
         // Every diff line of this file on the comment's side.
         let mut candidates: Vec<(u32, usize, usize, &str)> = Vec::new(); // (lineno, hunk, line, content)
@@ -84,24 +91,40 @@ pub fn reanchor(diff: &DiffResult, comments: &mut [Comment]) -> (Vec<Placed>, bo
             }
         }
 
-        // 1. Exact: stored line number still carries the snippet content.
-        let exact = candidates
-            .iter()
-            .find(|(n, _, _, c)| *n == comment.lines.1 && *c == target);
-        // 2. Moved: same content elsewhere; nearest occurrence wins.
-        //    Blank targets match too promiscuously to be trusted.
-        let hit = exact.or_else(|| {
-            if target.trim().is_empty() {
-                return None;
+        // Match the whole same-side snippet, not just its final line. Of the
+        // matching sequences, an exact end line wins; otherwise the nearest
+        // moved occurrence wins. All-blank snippets move too promiscuously.
+        let mut exact: Option<(u32, usize, usize, &str)> = None;
+        let mut moved: Option<(u32, usize, usize, &str)> = None;
+        let movable = target.iter().any(|line| !line.trim().is_empty());
+        if !target.is_empty() {
+            for window in candidates.windows(target.len()) {
+                if !window
+                    .iter()
+                    .zip(&target)
+                    .all(|((_, _, _, content), expected)| *content == expected)
+                {
+                    continue;
+                }
+                let &(n, hi, li, content) = window.last().expect("non-empty target window");
+                let candidate = (n, hi, li, content);
+                if n == comment.lines.1 {
+                    exact = Some(candidate);
+                    break;
+                }
+                if movable
+                    && moved.as_ref().is_none_or(|(best, _, _, _)| {
+                        n.abs_diff(comment.lines.1) < best.abs_diff(comment.lines.1)
+                    })
+                {
+                    moved = Some(candidate);
+                }
             }
-            candidates
-                .iter()
-                .filter(|(_, _, _, c)| *c == target)
-                .min_by_key(|(n, _, _, _)| n.abs_diff(comment.lines.1))
-        });
+        }
+        let hit = exact.or(moved);
 
         let anchor = match hit {
-            Some(&(n, hi, li, _)) => {
+            Some((n, hi, li, _)) => {
                 if n != comment.lines.1 {
                     let delta = i64::from(n) - i64::from(comment.lines.1);
                     comment.lines.0 = (i64::from(comment.lines.0) + delta).max(1) as u32;
@@ -145,30 +168,49 @@ pub struct CommentStore {
 }
 
 impl CommentStore {
-    pub fn load(repo: &Repository) -> Self {
+    pub fn load(repo: &Repository) -> Result<Self> {
         let path = repo.path().join("gittre").join("comments.json");
-        let data: StoreFile = std::fs::read(&path)
-            .ok()
-            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-            .unwrap_or_default();
-        CommentStore {
+        let data: StoreFile = match std::fs::read(&path) {
+            Ok(bytes) => serde_json::from_slice(&bytes)
+                .with_context(|| format!("parsing {}", path.display()))?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => StoreFile::default(),
+            Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+        };
+        let next_id = data
+            .comments
+            .iter()
+            .map(|comment| comment.id.saturating_add(1))
+            .max()
+            .unwrap_or(1)
+            .max(data.next_id)
+            .max(1);
+        Ok(CommentStore {
             path,
             comments: data.comments,
-            next_id: data.next_id.max(1),
-        }
+            next_id,
+        })
     }
 
-    fn save(&self) -> Result<()> {
+    fn save_state(&self, comments: &[Comment], next_id: u64) -> Result<()> {
         if let Some(dir) = self.path.parent() {
             std::fs::create_dir_all(dir).context("creating comment dir")?;
         }
         let data = StoreFile {
-            next_id: self.next_id,
-            comments: self.comments.clone(),
+            next_id,
+            comments: comments.to_vec(),
         };
         let tmp = self.path.with_extension("json.tmp");
         std::fs::write(&tmp, serde_json::to_vec_pretty(&data)?).context("writing comments")?;
         std::fs::rename(&tmp, &self.path).context("committing comments file")?;
+        Ok(())
+    }
+
+    /// Persist a proposed state before exposing it in memory, so a failed
+    /// write leaves the live store exactly as it was.
+    fn commit_state(&mut self, comments: Vec<Comment>, next_id: u64) -> Result<()> {
+        self.save_state(&comments, next_id)?;
+        self.comments = comments;
+        self.next_id = next_id;
         Ok(())
     }
 
@@ -182,8 +224,8 @@ impl CommentStore {
         scope: String,
     ) -> Result<()> {
         let id = self.next_id;
-        self.next_id += 1;
-        self.comments.push(Comment {
+        let mut comments = self.comments.clone();
+        comments.push(Comment {
             id,
             path,
             new_side,
@@ -194,41 +236,55 @@ impl CommentStore {
             scope,
             outdated: false,
         });
-        self.save()
+        self.commit_state(comments, id + 1)
     }
 
     pub fn edit(&mut self, id: u64, body: String) -> Result<()> {
-        if let Some(c) = self.comments.iter_mut().find(|c| c.id == id) {
-            c.body = body;
-        }
-        self.save()
+        let mut comments = self.comments.clone();
+        let Some(c) = comments.iter_mut().find(|c| c.id == id) else {
+            return Ok(());
+        };
+        c.body = body;
+        self.commit_state(comments, self.next_id)
     }
 
     pub fn delete(&mut self, id: u64) -> Result<()> {
-        self.comments.retain(|c| c.id != id);
-        self.save()
+        let mut comments = self.comments.clone();
+        let before = comments.len();
+        comments.retain(|c| c.id != id);
+        if comments.len() == before {
+            return Ok(());
+        }
+        self.commit_state(comments, self.next_id)
     }
 
     pub fn delete_all(&mut self) -> Result<()> {
-        self.comments.clear();
-        self.save()
+        if self.comments.is_empty() {
+            return Ok(());
+        }
+        self.commit_state(Vec::new(), self.next_id)
     }
 
     /// Reinsert comments removed by a delete (the `u` undo). Ids were minted
     /// by this store and stay unique because next_id never decreases.
     pub fn restore(&mut self, mut comments: Vec<Comment>) -> Result<()> {
-        self.comments.append(&mut comments);
-        self.save()
+        if comments.is_empty() {
+            return Ok(());
+        }
+        let mut restored = self.comments.clone();
+        restored.append(&mut comments);
+        self.commit_state(restored, self.next_id)
     }
 
     /// Re-anchor all comments against a diff, persisting any moves or
     /// outdated-state changes.
-    pub fn reanchor(&mut self, diff: &DiffResult) -> Vec<Placed> {
-        let (placed, changed) = reanchor(diff, &mut self.comments);
+    pub fn reanchor(&mut self, diff: &DiffResult) -> Result<Vec<Placed>> {
+        let mut comments = self.comments.clone();
+        let (placed, changed) = reanchor(diff, &mut comments);
         if changed {
-            let _ = self.save();
+            self.commit_state(comments, self.next_id)?;
         }
-        placed
+        Ok(placed)
     }
 
     pub fn count_for_path(&self, path: &str) -> usize {
@@ -287,6 +343,7 @@ fn now() -> u64 {
 mod tests {
     use super::*;
     use crate::git::diff::{DiffLine, FileDiff, FileStatus, Hunk};
+    use std::fs;
 
     fn diff_with(path: &str, new_linenos: &[u32]) -> DiffResult {
         DiffResult {
@@ -387,6 +444,50 @@ mod tests {
     }
 
     #[test]
+    fn multi_line_anchor_matches_the_whole_same_side_snippet() {
+        let diff = DiffResult {
+            files: vec![FileDiff {
+                path: "a.rs".into(),
+                old_path: None,
+                status: FileStatus::Modified,
+                binary: false,
+                large: false,
+                byte_size: 0,
+                untracked_dir: false,
+                hunks: vec![Hunk {
+                    header: "@@ @@".into(),
+                    lines: [(20, "other"), (21, "}"), (30, "unique"), (31, "}")]
+                        .into_iter()
+                        .map(|(n, content)| DiffLine {
+                            origin: '+',
+                            old_lineno: None,
+                            new_lineno: Some(n),
+                            content: content.into(),
+                        })
+                        .collect(),
+                }],
+                additions: 4,
+                deletions: 0,
+            }],
+            additions: 4,
+            deletions: 0,
+        };
+        let mut c = comment("a.rs", 21);
+        c.lines = (20, 21);
+        c.snippet = vec!["+unique".into(), "+}".into()];
+        let mut comments = [c];
+
+        let (placed, changed) = reanchor(&diff, &mut comments);
+
+        assert!(matches!(
+            placed[0].anchor,
+            Anchor::Line { hunk: 0, line: 3 }
+        ));
+        assert!(changed);
+        assert_eq!(comments[0].lines, (30, 31));
+    }
+
+    #[test]
     fn vanished_content_goes_outdated_and_can_recover() {
         let diff = diff_with("a.rs", &[10, 11]);
         let mut comments = [comment("a.rs", 99)];
@@ -466,7 +567,7 @@ mod tests {
     fn store_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
         let repo = Repository::init(dir.path()).unwrap();
-        let mut store = CommentStore::load(&repo);
+        let mut store = CommentStore::load(&repo).unwrap();
         store
             .add(
                 "a.rs".into(),
@@ -477,21 +578,103 @@ mod tests {
                 "uncommitted changes".into(),
             )
             .unwrap();
-        let reloaded = CommentStore::load(&repo);
+        let reloaded = CommentStore::load(&repo).unwrap();
         assert_eq!(reloaded.comments.len(), 1);
         assert_eq!(reloaded.comments[0].body, "hello");
         assert_eq!(reloaded.comments[0].id, 1);
 
         let mut store = reloaded;
         store.delete(1).unwrap();
-        assert!(CommentStore::load(&repo).comments.is_empty());
+        assert!(CommentStore::load(&repo).unwrap().comments.is_empty());
+    }
+
+    #[test]
+    fn malformed_store_is_reported_instead_of_treated_as_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        let store_dir = repo.path().join("gittre");
+        fs::create_dir(&store_dir).unwrap();
+        fs::write(store_dir.join("comments.json"), b"{not json").unwrap();
+
+        let err = CommentStore::load(&repo)
+            .err()
+            .expect("malformed store fails");
+        assert!(format!("{err:#}").contains("parsing"));
+    }
+
+    #[test]
+    fn failed_write_leaves_mutations_out_of_memory() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        let mut store = CommentStore::load(&repo).unwrap();
+        store
+            .add(
+                "a.rs".into(),
+                true,
+                (1, 1),
+                vec!["+old".into()],
+                "original".into(),
+                "test".into(),
+            )
+            .unwrap();
+        fs::create_dir(store.path.with_extension("json.tmp")).unwrap();
+
+        assert!(store.edit(1, "changed".into()).is_err());
+        assert_eq!(store.comments[0].body, "original");
+        assert!(store.delete(1).is_err());
+        assert_eq!(store.comments.len(), 1);
+    }
+
+    #[test]
+    fn failed_reanchor_write_keeps_stored_position() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        let mut store = CommentStore::load(&repo).unwrap();
+        store
+            .add(
+                "a.rs".into(),
+                true,
+                (11, 11),
+                vec!["+line 11".into()],
+                "note".into(),
+                "test".into(),
+            )
+            .unwrap();
+        fs::create_dir(store.path.with_extension("json.tmp")).unwrap();
+        let moved = DiffResult {
+            files: vec![FileDiff {
+                path: "a.rs".into(),
+                old_path: None,
+                status: FileStatus::Modified,
+                binary: false,
+                large: false,
+                byte_size: 0,
+                untracked_dir: false,
+                hunks: vec![Hunk {
+                    header: "@@ @@".into(),
+                    lines: vec![DiffLine {
+                        origin: '+',
+                        old_lineno: None,
+                        new_lineno: Some(14),
+                        content: "line 11".into(),
+                    }],
+                }],
+                additions: 1,
+                deletions: 0,
+            }],
+            additions: 1,
+            deletions: 0,
+        };
+
+        assert!(store.reanchor(&moved).is_err());
+        assert_eq!(store.comments[0].lines, (11, 11));
     }
 
     #[test]
     fn restore_after_delete_keeps_id_and_uniqueness() {
         let dir = tempfile::tempdir().unwrap();
         let repo = Repository::init(dir.path()).unwrap();
-        let mut store = CommentStore::load(&repo);
+        let mut store = CommentStore::load(&repo).unwrap();
         store
             .add(
                 "a.rs".into(),
@@ -506,7 +689,7 @@ mod tests {
         store.delete(deleted.id).unwrap();
         store.restore(vec![deleted]).unwrap();
 
-        let reloaded = CommentStore::load(&repo);
+        let reloaded = CommentStore::load(&repo).unwrap();
         assert_eq!(reloaded.comments.len(), 1);
         assert_eq!(reloaded.comments[0].id, 1);
         assert_eq!(reloaded.comments[0].body, "hello");

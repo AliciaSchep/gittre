@@ -40,10 +40,6 @@ impl TextEditor {
         &self.text
     }
 
-    pub fn into_string(self) -> String {
-        self.text
-    }
-
     pub fn insert_char(&mut self, c: char) {
         self.text.insert(self.cursor, c);
         self.cursor += c.len_utf8();

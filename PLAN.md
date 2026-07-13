@@ -121,6 +121,9 @@ Running `gittre` in a repo opens the **scope picker** — a simple menu, no flag
   requests the same refresh.
 - The UI swaps in the new diff while preserving cursor/viewport position (by
   file + offset), tree folds, search, focus, and comment anchors.
+- Diff loads and lazy file expansions share a scope-generation id. Stale work
+  is discarded before loading and stale responses can never splice into a
+  newer review snapshot.
 - A subtle "reloading" / "reloaded" status appears in the title bar; the UI
   remains responsive while git work runs.
 - Filesystem watching was removed in 2026-07. For this primarily personal tool,
@@ -266,9 +269,10 @@ loss.
 - **Pool:** one per repo — like a PR review. A comment appears in whichever
   scope its anchor matches (comment on uncommitted work, still see it when
   reviewing the branch after committing). Scope at creation is metadata only.
-- **Anchoring:** file line numbers + snippet, never diff-row indices.
-  Re-anchor cascade on every (re)load: exact (snippet still at stored lines)
-  → moved (snippet found elsewhere in the file; position updated) → outdated
+- **Anchoring:** file line numbers + snippet, never diff-row indices. The full
+  same-side snippet is matched, so a repeated final line cannot steal a
+  multi-line comment. Re-anchor cascade on every (re)load: exact (snippet still
+  at stored lines) → moved (snippet found elsewhere; position updated) → outdated
   (collapsed "⚠ n outdated" row at the top of the file's section, expandable,
   showing the preserved snippet).
 - **UX:** `v` select → `c` comment (Enter saves, Alt+Enter newline, Esc
@@ -278,7 +282,9 @@ loss.
   prompt) to start a review anew; `u` restores whatever the last delete
   removed (single or all). No resolve state for now (revisit later).
 - **Storage:** JSON at `<gitdir>/gittre/comments.json` — never touches the
-  working tree; linked worktrees get their own review (separate gitdir).
+  working tree; linked worktrees get their own review (separate gitdir). Missing
+  is an empty review, but unreadable/malformed stores are errors. Every mutation,
+  including re-anchoring, persists atomically before changing in-memory state.
 - **Export (M5.3):** markdown grouped by file — line refs, fenced snippet,
   body; outdated flagged. `e` opens an exact preview with copy/write actions;
   also `gittre export`.

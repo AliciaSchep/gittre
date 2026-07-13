@@ -2,7 +2,7 @@ use anyhow::{Context, Result, anyhow};
 use git2::{DiffOptions, Oid, Repository};
 
 /// What is being reviewed. Each variant maps to one entry in the scope picker.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Scope {
     /// Working tree + index vs HEAD, untracked included.
     Uncommitted,

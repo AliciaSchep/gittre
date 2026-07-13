@@ -44,11 +44,11 @@ struct ReviewState {
 }
 
 impl ReviewState {
-    fn new(scope: Scope, diff: DiffResult, store: &mut CommentStore) -> Self {
-        let placed = store.reanchor(&diff);
+    fn new(scope: Scope, diff: DiffResult, store: &mut CommentStore) -> Result<Self> {
+        let placed = store.reanchor(&diff)?;
         let stream = Stream::new(&diff, &placed, &store.comments);
         let tree = FileTree::new(&diff.files, &comment_counts(&diff, store));
-        ReviewState {
+        Ok(ReviewState {
             scope,
             diff,
             stream,
@@ -57,7 +57,7 @@ impl ReviewState {
             show_tree: true,
             tree_width: None,
             file_view: None,
-        }
+        })
     }
 }
 
@@ -136,8 +136,7 @@ pub fn debug_log(msg: &str) {
 impl App {
     /// `initial`: a scope pre-resolved (and validated) from CLI flags. Its
     /// diff loads on the background thread; the TUI appears immediately.
-    pub fn new(repo: Repository, initial: Option<Scope>) -> Self {
-        let store = CommentStore::load(&repo);
+    pub fn new(repo: Repository, initial: Option<Scope>, store: CommentStore) -> Self {
         let (event_tx, events) = channel();
         let loader_path = repo.workdir().unwrap_or_else(|| repo.path()).to_path_buf();
         let loader = spawn_loader(loader_path, event_tx);
@@ -385,8 +384,8 @@ impl App {
                 debug_log(&format!("event: Counts seq={seq} (cur={})", self.seq))
             }
             AppEvent::File {
-                scope_label, path, ..
-            } => debug_log(&format!("event: File {path} ({scope_label})")),
+                seq, scope, path, ..
+            } => debug_log(&format!("event: File seq={seq} {path} ({})", scope.label())),
         }
         match event {
             AppEvent::Diff {
@@ -408,26 +407,35 @@ impl App {
                 };
                 match &mut self.screen {
                     // Same scope already open: this is a reload.
-                    Screen::Review(review) if review.scope.label() == scope.label() => {
-                        apply_reload(review, diff, &mut self.store);
-                        self.reloaded_at = Some(Instant::now());
+                    Screen::Review(review) if review.scope == scope => {
+                        match apply_reload(review, diff, &mut self.store) {
+                            Ok(()) => self.reloaded_at = Some(Instant::now()),
+                            Err(e) => self.error = Some(format!("{e:#}")),
+                        }
                     }
                     // Otherwise it's a scope being opened.
-                    _ => {
-                        let review = ReviewState::new(scope, diff, &mut self.store);
-                        debug_log(&format!(
-                            "review created: {} files",
-                            review.diff.files.len()
-                        ));
-                        self.screen = Screen::Review(Box::new(review));
-                    }
+                    _ => match ReviewState::new(scope, diff, &mut self.store) {
+                        Ok(review) => {
+                            debug_log(&format!(
+                                "review created: {} files",
+                                review.diff.files.len()
+                            ));
+                            self.screen = Screen::Review(Box::new(review));
+                        }
+                        Err(e) => self.error = Some(format!("{e:#}")),
+                    },
                 }
             }
             AppEvent::File {
-                scope_label,
+                seq,
+                scope,
                 path,
                 files,
             } => {
+                if seq != self.seq || !matches!(&self.screen, Screen::Review(r) if r.scope == scope)
+                {
+                    return;
+                }
                 let loaded = match files {
                     Ok(f) => f,
                     Err(e) => {
@@ -435,22 +443,18 @@ impl App {
                         return;
                     }
                 };
-                let matches_screen = matches!(
-                    &self.screen,
-                    Screen::Review(r) if r.scope.label() == scope_label
-                );
-                if !matches_screen {
-                    return;
-                }
                 if let Screen::Review(review) = &mut self.screen {
                     if let Some(pos) = review.diff.files.iter().position(|f| f.path == path) {
-                        review.diff.files.splice(pos..=pos, loaded);
-                        // Re-sort and re-total after the splice.
-                        review.diff =
-                            DiffResult::from_files(std::mem::take(&mut review.diff.files));
+                        let mut files = review.diff.files.clone();
+                        files.splice(pos..=pos, loaded);
+                        // Treat expansion like a small reload: if comment
+                        // persistence fails, the old diff/stream stay paired.
+                        let diff = DiffResult::from_files(files);
+                        if let Err(e) = apply_reload(review, diff, &mut self.store) {
+                            self.error = Some(format!("{e:#}"));
+                        }
                     }
                 }
-                self.rebuild_review();
             }
             AppEvent::Counts { seq, counts } => {
                 if seq != self.seq {
@@ -786,10 +790,11 @@ impl App {
         if self.confirm_clear {
             self.confirm_clear = false;
             if matches!(code, KeyCode::Char('y') | KeyCode::Char('Y')) {
-                self.undo_comments = self.store.comments.clone();
+                let deleted = self.store.comments.clone();
                 if let Err(e) = self.store.delete_all() {
                     self.error = Some(format!("{e:#}"));
                 } else {
+                    self.undo_comments = deleted;
                     self.notice = Some("all comments deleted (u restores)".into());
                 }
                 self.rebuild_review();
@@ -861,17 +866,19 @@ impl App {
                 draft.editor.insert_char('\n')
             }
             KeyCode::Enter => {
-                let draft = self.comment_draft.take().unwrap();
                 if draft.editor.as_str().trim().is_empty() {
+                    self.comment_draft = None;
                     self.notice = Some("empty comment discarded".into());
                     return;
                 }
-                let body = draft.editor.into_string();
+                let body = draft.editor.as_str().to_string();
+                let editing = draft.editing;
+                let target = draft.target.clone();
                 let scope_label = match &self.screen {
                     Screen::Review(r) => r.scope.label(),
                     _ => String::new(),
                 };
-                let result = match (draft.editing, draft.target) {
+                let result = match (editing, target) {
                     (Some(id), _) => self.store.edit(id, body),
                     (None, Some(t)) => {
                         self.store
@@ -881,7 +888,9 @@ impl App {
                 };
                 if let Err(e) = result {
                     self.error = Some(format!("{e:#}"));
+                    return; // keep the draft open so the text can be retried
                 }
+                self.comment_draft = None;
                 self.rebuild_review();
             }
             KeyCode::Char(c) => draft.editor.insert_char(c),
@@ -896,7 +905,13 @@ impl App {
         };
         let anchor = review.stream.anchor(&review.diff.files);
         let query = review.stream.search_query();
-        let placed = self.store.reanchor(&review.diff);
+        let placed = match self.store.reanchor(&review.diff) {
+            Ok(placed) => placed,
+            Err(e) => {
+                self.error = Some(format!("{e:#}"));
+                return;
+            }
+        };
         review.stream = Stream::new(&review.diff, &placed, &self.store.comments);
         let collapsed = review.tree.collapsed_dirs();
         review.tree = FileTree::new(
@@ -1297,11 +1312,12 @@ impl App {
             }
             Action::RestoreComments => {
                 if !self.undo_comments.is_empty() {
-                    let comments = std::mem::take(&mut self.undo_comments);
+                    let comments = self.undo_comments.clone();
                     let n = comments.len();
                     if let Err(e) = self.store.restore(comments) {
                         self.error = Some(format!("{e:#}"));
                     } else {
+                        self.undo_comments.clear();
                         self.notice = Some(format!(
                             "restored {n} comment{}",
                             if n == 1 { "" } else { "s" }
@@ -1430,6 +1446,7 @@ impl App {
                         format!("loading diff for {path}…")
                     });
                     let _ = self.loader.send(LoadRequest::File {
+                        seq: self.seq,
                         scope: review.scope.clone(),
                         path,
                         untracked_dir,
@@ -1685,13 +1702,17 @@ fn adaptive_tree_width(preferred: u16, manual: Option<u16>, available: u16) -> u
 
 /// Swap in a freshly loaded diff, preserving the reader's position (by file
 /// path + offset), the tree's fold state, and focus.
-fn apply_reload(review: &mut ReviewState, diff: DiffResult, store: &mut CommentStore) {
+fn apply_reload(
+    review: &mut ReviewState,
+    diff: DiffResult,
+    store: &mut CommentStore,
+) -> Result<()> {
     let anchor = review.stream.anchor(&review.diff.files);
     let collapsed = review.tree.collapsed_dirs();
     let query = review.stream.search_query();
 
+    let placed = store.reanchor(&diff)?;
     review.diff = diff;
-    let placed = store.reanchor(&review.diff);
     review.stream = Stream::new(&review.diff, &placed, &store.comments);
     review.tree = FileTree::new(&review.diff.files, &comment_counts(&review.diff, store));
     review.tree.apply_collapsed(&collapsed);
@@ -1711,6 +1732,7 @@ fn apply_reload(review: &mut ReviewState, diff: DiffResult, store: &mut CommentS
     } else {
         sync_tree(review);
     }
+    Ok(())
 }
 
 /// Keep the tree highlight in sync with the file at the top of the stream.

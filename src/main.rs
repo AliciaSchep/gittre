@@ -89,7 +89,7 @@ fn main() -> Result<()> {
         .with_context(|| format!("not a git repository: {}", args.repo.display()))?;
 
     if let Some(Command::Export { output }) = &args.command {
-        let store = comments::CommentStore::load(&repo);
+        let store = comments::CommentStore::load(&repo)?;
         let title = repo
             .workdir()
             .and_then(|p| p.file_name())
@@ -115,6 +115,9 @@ fn main() -> Result<()> {
     // mode, so errors print as plain text; the diff itself loads in the
     // background once the TUI is up.
     let initial = args.initial_scope(&repo)?;
+    // Load comments before entering raw mode so a corrupt or unreadable store
+    // is reported normally and can never be overwritten as an empty review.
+    let store = comments::CommentStore::load(&repo)?;
 
     let mut terminal = ratatui::init();
     let _ = ratatui::crossterm::execute!(
@@ -133,7 +136,7 @@ fn main() -> Result<()> {
         );
         prev_hook(info);
     }));
-    let result = app::App::new(repo, initial).run(&mut terminal);
+    let result = app::App::new(repo, initial, store).run(&mut terminal);
     let _ = ratatui::crossterm::execute!(
         std::io::stdout(),
         ratatui::crossterm::event::DisableMouseCapture,
