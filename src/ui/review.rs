@@ -530,20 +530,44 @@ impl Stream {
         self.ensure_cursor_visible();
     }
 
-    /// The first content row at or below the top of the viewport:
-    /// (file index, 1-based line number on the new side when known).
+    /// The cursor's position in its current file: a comment block resolves to
+    /// the line it follows, while headers resolve to the next line in the same
+    /// file. Never crosses a file boundary.
     pub fn current_position(&self, files: &[FileDiff]) -> Option<(usize, Option<u32>)> {
-        self.rows
-            .iter()
-            .skip(self.scroll)
-            .find_map(|row| match *row {
-                Row::Line(fi, hi, li) => {
-                    let line = &files[fi].hunks[hi].lines[li];
-                    Some((fi, line.new_lineno.or(line.old_lineno)))
-                }
-                Row::FileHeader(fi) => Some((fi, None)),
-                _ => None,
-            })
+        let fi = self.current_file()?;
+        let start = self.file_starts[fi];
+        let end = self
+            .file_starts
+            .get(fi + 1)
+            .copied()
+            .unwrap_or(self.rows.len());
+        let cursor = self.cursor.clamp(start, end.saturating_sub(1));
+        let line_number = |row: &Row| match *row {
+            Row::Line(row_fi, hi, li) if row_fi == fi => {
+                let line = &files[fi].hunks[hi].lines[li];
+                line.new_lineno.or(line.old_lineno)
+            }
+            _ => None,
+        };
+
+        if matches!(self.rows.get(cursor), Some(Row::FileHeader(_))) {
+            return Some((fi, None));
+        }
+
+        let on_comment = matches!(
+            self.rows.get(cursor),
+            Some(Row::CommentHeader(_))
+                | Some(Row::CommentSnippet(_, _))
+                | Some(Row::CommentBody(_, _, _, _))
+        );
+        let before = || self.rows[start..cursor].iter().rev().find_map(&line_number);
+        let after = || self.rows[cursor..end].iter().find_map(&line_number);
+        let line = if on_comment {
+            before().or_else(after)
+        } else {
+            after().or_else(before)
+        };
+        Some((fi, line))
     }
 
     /// Index of the file the cursor is in.
@@ -993,6 +1017,20 @@ mod tests {
         }
     }
 
+    fn comment(path: &str, line: u32) -> Comment {
+        Comment {
+            id: 1,
+            path: path.into(),
+            new_side: true,
+            lines: (line, line),
+            snippet: vec![format!("+line {}", line - 1)],
+            body: "note".into(),
+            created_at: 0,
+            scope: "test".into(),
+            outdated: false,
+        }
+    }
+
     #[test]
     fn anchor_survives_growth_of_earlier_files() {
         let before = diff(&[("a.txt", 3), ("b.txt", 5)]);
@@ -1024,6 +1062,79 @@ mod tests {
         stream.set_viewport(4);
         stream.restore(&anchor, &after.files);
         assert!(stream.scroll < 6, "scroll clamped into the smaller diff");
+    }
+
+    #[test]
+    fn current_position_follows_cursor_not_viewport() {
+        let diff = diff(&[("a.rs", 20)]);
+        let mut stream = Stream::new(&diff, &[], &[]);
+        stream.viewport.set(8);
+        stream.set_cursor(7);
+
+        assert_eq!(stream.scroll, 0, "cursor remains inside the first viewport");
+        assert_eq!(stream.current_position(&diff.files), Some((0, Some(6))));
+    }
+
+    #[test]
+    fn last_line_comment_does_not_cross_into_next_file() {
+        let diff = diff(&[("a.rs", 1), ("b.rs", 1)]);
+        let comments = [comment("a.rs", 1)];
+        let placed = [Placed {
+            comment: 0,
+            file: 0,
+            anchor: Anchor::Line { hunk: 0, line: 0 },
+        }];
+        let mut stream = Stream::new(&diff, &placed, &comments);
+        stream.cursor = stream.comment_starts[0];
+
+        assert_eq!(stream.current_position(&diff.files), Some((0, Some(1))));
+    }
+
+    #[test]
+    fn last_line_comment_in_final_file_keeps_its_line() {
+        let diff = diff(&[("a.rs", 1)]);
+        let comments = [comment("a.rs", 1)];
+        let placed = [Placed {
+            comment: 0,
+            file: 0,
+            anchor: Anchor::Line { hunk: 0, line: 0 },
+        }];
+        let mut stream = Stream::new(&diff, &placed, &comments);
+        stream.cursor = stream.comment_starts[0];
+
+        assert_eq!(stream.current_position(&diff.files), Some((0, Some(1))));
+    }
+
+    #[test]
+    fn inline_comment_prefers_the_line_it_follows() {
+        let diff = diff(&[("a.rs", 2)]);
+        let comments = [comment("a.rs", 1)];
+        let placed = [Placed {
+            comment: 0,
+            file: 0,
+            anchor: Anchor::Line { hunk: 0, line: 0 },
+        }];
+        let mut stream = Stream::new(&diff, &placed, &comments);
+        stream.cursor = stream.comment_starts[0];
+
+        assert_eq!(stream.current_position(&diff.files), Some((0, Some(1))));
+    }
+
+    #[test]
+    fn outdated_comment_at_file_top_uses_the_next_line() {
+        let diff = diff(&[("a.rs", 2)]);
+        let mut outdated = comment("a.rs", 99);
+        outdated.outdated = true;
+        let comments = [outdated];
+        let placed = [Placed {
+            comment: 0,
+            file: 0,
+            anchor: Anchor::Outdated,
+        }];
+        let mut stream = Stream::new(&diff, &placed, &comments);
+        stream.cursor = stream.comment_starts[0];
+
+        assert_eq!(stream.current_position(&diff.files), Some((0, Some(1))));
     }
 
     #[test]

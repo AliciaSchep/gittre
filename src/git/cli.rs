@@ -111,12 +111,14 @@ pub fn load_worktree_file(workdir: &Path, staged: bool, path: &str) -> Result<Fi
         .ok_or_else(|| anyhow::anyhow!("'{path}' no longer in the diff"))
 }
 
-/// (uncommitted, staged) changed-file counts from one status scan.
+/// (uncommitted, staged) changed-entry counts from one status scan. Fully
+/// untracked directories count as one collapsed entry, matching the initial
+/// review stream and preserving git's untracked-cache acceleration.
 pub fn worktree_counts(workdir: &Path) -> Result<(usize, usize)> {
     let out = run(
         {
             let mut cmd = git(workdir);
-            cmd.args(["status", "--porcelain", "-z", "--untracked-files=all"]);
+            cmd.args(["status", "--porcelain", "-z", "--untracked-files=normal"]);
             cmd
         },
         "status",
@@ -494,6 +496,7 @@ fn unquote(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     const SAMPLE: &str = "\
 diff --git a/src/lib.rs b/src/lib.rs
@@ -586,5 +589,16 @@ index 000..333
         assert_eq!(unquote("\"with \\\"quote\\\".txt\""), "with \"quote\".txt");
         assert_eq!(unquote("\"tab\\there\""), "tab\there");
         assert_eq!(unquote("\"caf\\303\\251.txt\""), "café.txt");
+    }
+
+    #[test]
+    fn worktree_counts_collapses_fully_untracked_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        git2::Repository::init(dir.path()).unwrap();
+        fs::create_dir(dir.path().join("generated")).unwrap();
+        fs::write(dir.path().join("generated/one.txt"), "one\n").unwrap();
+        fs::write(dir.path().join("generated/two.txt"), "two\n").unwrap();
+
+        assert_eq!(worktree_counts(dir.path()).unwrap(), (1, 0));
     }
 }

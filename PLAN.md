@@ -44,7 +44,9 @@ Running `gittre` in a repo opens the **scope picker** — a simple menu, no flag
   1-5/↑↓ select   ⏎ open   q quit
 ```
 
-- Counts are computed up front so empty scopes are visibly empty.
+- Counts fill in in the background so the picker renders immediately. Fully
+  untracked directories count as one collapsed entry, matching the initial
+  review stream and preserving git's untracked-cache acceleration.
 - Option 3 reviews against the **fork point**: the commit right before the
   first commit the branch introduced, found by walking HEAD's history with
   every *other* branch hidden (remote copies of the branch itself — same

@@ -253,6 +253,17 @@ impl App {
 
     fn on_mouse(&mut self, mouse: MouseEvent) {
         let (col, row) = (mouse.column, mouse.row);
+        // Match keyboard routing: the topmost overlay consumes the event so
+        // mouse input can never mutate a hidden screen underneath it.
+        if self.show_help {
+            match mouse.kind {
+                MouseEventKind::ScrollDown => self.help_scroll = self.help_scroll.saturating_add(3),
+                MouseEventKind::ScrollUp => self.help_scroll = self.help_scroll.saturating_sub(3),
+                MouseEventKind::Down(MouseButton::Left) => self.show_help = false,
+                _ => {}
+            }
+            return;
+        }
         if let Some(draft) = &mut self.comment_draft {
             match mouse.kind {
                 MouseEventKind::ScrollDown => draft.editor.scroll_by(3),
@@ -264,7 +275,7 @@ impl App {
             }
             return;
         }
-        if self.export_input.is_some() {
+        if self.confirm_clear || self.search_input.is_some() || self.export_input.is_some() {
             return;
         }
         if let Some(preview) = &mut self.export_preview {
@@ -297,6 +308,10 @@ impl App {
     fn mouse_scroll(&mut self, direction: isize, col: u16, row: u16) {
         match &mut self.screen {
             Screen::Review(review) => {
+                if let Some(view) = &mut review.file_view {
+                    view.scroll_by(direction * 3);
+                    return;
+                }
                 // Wheel over an *active* tree moves its selection; everywhere
                 // else it scrolls the diff (the tree is passive by default).
                 if review.focus == Focus::Tree && review.tree.hit(col, row).is_some() {
@@ -313,12 +328,11 @@ impl App {
     }
 
     fn mouse_click(&mut self, col: u16, row: u16) {
-        if self.show_help {
-            self.show_help = false;
-            return;
-        }
         match &mut self.screen {
             Screen::Review(review) => {
+                if review.file_view.is_some() {
+                    return;
+                }
                 if let Some(idx) = review.tree.hit(col, row) {
                     review.tree.selected = idx;
                     if let Some(file_idx) = review.tree.activate() {
