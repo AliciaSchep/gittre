@@ -14,7 +14,7 @@ use crate::comments::{Comment, CommentStore, export_markdown};
 use crate::event::{AppEvent, LoadRequest, ScopeCounts, spawn_loader};
 use crate::git::diff::DiffResult;
 use crate::git::log::commit_log;
-use crate::git::scope::{Scope, base_candidates, detect_base, file_content};
+use crate::git::scope::{Scope, base_candidates, file_content, forkable_branch};
 use crate::keymap::{self, Action, KeyPress, Lookup};
 use crate::ui::fileview::FileView;
 use crate::ui::highlight::Highlighter;
@@ -1628,22 +1628,25 @@ fn build_picker_skeleton(repo: &Repository) -> ScopePicker {
             action: ScopeAction::Open(Scope::Staged),
         },
     ];
-    match detect_base(repo) {
-        Some(base) => {
-            let scope = Scope::Branch { base: base.clone() };
-            items.push(ScopeItem {
-                title: format!("Branch vs {base}"),
-                detail: "…".into(),
-                action: ScopeAction::Open(scope),
-            });
-        }
-        // Always show the entry; explain instead of silently hiding it.
-        None => items.push(ScopeItem {
-            title: "Branch vs a base you pick…".into(),
-            detail: "no base auto-detected".into(),
-            action: ScopeAction::PickBase,
-        }),
+    let forkable = forkable_branch(repo);
+    if let Some(branch) = forkable.clone() {
+        items.push(ScopeItem {
+            title: "Branch vs fork point".into(),
+            detail: "…".into(),
+            action: ScopeAction::Open(Scope::BranchFork { branch }),
+        });
     }
+    // Explicit-base compare is always on the menu; when no fork point is
+    // definable it explains why the entry above is missing.
+    items.push(ScopeItem {
+        title: "Branch vs a base you pick…".into(),
+        detail: if forkable.is_some() {
+            String::new()
+        } else {
+            "no fork point detected".into()
+        },
+        action: ScopeAction::PickBase,
+    });
     items.push(ScopeItem {
         title: "A specific commit…".into(),
         detail: String::new(),

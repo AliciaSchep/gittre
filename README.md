@@ -34,8 +34,9 @@ right now:
 ╭ review what? ────────────────────────────────────╮
 │ 1  Uncommitted changes                 2 files   │
 │ 2  Staged changes                       1 file   │
-│ 3  Branch vs main                      2 files   │
-│ 4  A specific commit…                            │
+│ 3  Branch vs fork point                2 files   │
+│ 4  Branch vs a base you pick…                    │
+│ 5  A specific commit…                            │
 ╰──────────────────────────────────────────────────╯
 ```
 
@@ -45,8 +46,13 @@ tree alongside (`Tab` to jump via the tree, `t` to hide it). The view
 your reading position survives. In very large repositories, `--no-watch`
 disables that and `r` reloads on demand.
 
-CLI shortcuts: `gittre -u` (uncommitted) · `-s` (staged) · `-b [base]`
-(branch vs merge-base) · `gittre <rev>` · `gittre a..b` · `-C <path>`.
+The branch scope reviews everything the branch introduced: it diffs from the
+commit right before the branch's first own commit (its fork point), found
+structurally — pushing the branch or the trunk moving on never shrinks it.
+
+CLI shortcuts: `gittre -u` (uncommitted) · `-s` (staged) · `-b` (branch vs
+fork point) · `-b <base>` (vs merge-base) · `gittre <rev>` · `gittre a..b` ·
+`-C <path>`.
 
 ### Reading
 

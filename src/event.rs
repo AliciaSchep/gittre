@@ -133,9 +133,11 @@ pub fn spawn_loader(repo_path: PathBuf, events: Sender<AppEvent>) -> Sender<Load
                 let counts = ScopeCounts {
                     uncommitted,
                     staged,
-                    branch: scope::detect_base(&repo).map(|base| {
-                        let scope = Scope::Branch { base: base.clone() };
-                        (base, scope::file_count_fast(&repo, &scope))
+                    branch: scope::forkable_branch(&repo).map(|branch| {
+                        let scope = Scope::BranchFork {
+                            branch: branch.clone(),
+                        };
+                        (branch, scope::file_count_fast(&repo, &scope))
                     }),
                 };
                 if events.send(AppEvent::CountsLoaded { seq, counts }).is_err() {

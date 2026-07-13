@@ -34,8 +34,8 @@ src/comments.rs    comment model, JSON store (<gitdir>/gittre/), re-anchoring
                    cascade (exact -> moved -> outdated), markdown export
 src/git/cli.rs     worktree diffs via the git CLI (unified-diff parser,
                    status parsing, untracked synthesis) — see invariant below
-src/git/scope.rs   Scope enum, libgit2 diff building per scope, base
-                   detection, full-file content per scope
+src/git/scope.rs   Scope enum, libgit2 diff building per scope, fork-point
+                   detection (branch scope), full-file content per scope
 src/git/diff.rs    git2 diff -> DiffResult (tree-order sorted; tested here)
 src/git/log.rs     commit list for the picker
 src/ui/review.rs   the diff Stream: rows, cursor, selection, search, comment

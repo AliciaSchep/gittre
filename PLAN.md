@@ -16,7 +16,7 @@ previewed or exported as markdown.
 - View diffs for four first-class review scopes, reachable with zero memorized commands:
   1. **Uncommitted** — working tree vs HEAD (unstaged + staged together)
   2. **Staged** — index vs HEAD
-  3. **Branch** — current branch vs its base (auto-detected merge-base)
+  3. **Branch** — everything the current branch introduced (vs its fork point)
   4. **Commit** — a single commit picked from a log list
 - Secondary scope: **commit range** (pick start/end in the log list). Nice-to-have, not v1-critical.
 - Continuous multi-file diff browsing (scroll through the whole changeset) *and* a file tree to jump to a specific file.
@@ -36,19 +36,25 @@ Running `gittre` in a repo opens the **scope picker** — a simple menu, no flag
 ┌ gittre ── review what? ─────────────────────────────┐
 │ ▸ 1  Uncommitted changes          12 files          │
 │   2  Staged changes                3 files          │
-│   3  Branch vs main (merge-base)  27 files          │
-│   4  A specific commit…                             │
-│   5  A commit range…                                │
+│   3  Branch vs fork point         27 files          │
+│   4  Branch vs a base you pick…                     │
+│   5  A specific commit…                             │
 └─────────────────────────────────────────────────────┘
   1-5/↑↓ select   ⏎ open   q quit
 ```
 
 - Counts are computed up front so empty scopes are visibly empty.
-- Option 3 auto-detects the base: upstream tracking branch if set, else merge-base
-  with `main`/`master`/`develop` (first that exists); the detected base is shown
-  inline and can be changed with `b`.
-- Options 4/5 open the commit log list (subject, author, age); Enter picks a
-  commit, and in range mode you press Enter twice (start, then end).
+- Option 3 reviews against the **fork point**: the commit right before the
+  first commit the branch introduced, found by walking HEAD's history with
+  every *other* branch hidden (remote copies of the branch itself and its
+  upstream don't count — 2026-07 redesign, see §6). Recomputed on every load,
+  so it survives rebases. When no fork point is definable (only branch in
+  the repo, detached HEAD), the entry is hidden and option 4's detail says
+  why.
+- Option 4 compares against an explicitly picked branch (merge-base
+  semantics) — always on the menu (2026-07), not just a fallback.
+- Option 5 opens the commit log list (subject, author, age); Enter reviews a
+  commit, and Space marks a range start so the next Enter reviews the range.
 - CLI shortcuts exist for scripting/muscle-memory but are never required:
   `gittre` (picker) · `gittre -u` (uncommitted) · `gittre -s` (staged) ·
   `gittre -b [base]` (branch) · `gittre <sha>` · `gittre <a>..<b>`.
@@ -217,8 +223,17 @@ Each milestone is shippable; M1–M3 is already a useful daily tool.
 
 ## 6. Open questions / accepted defaults
 
-- **Base detection order** (upstream → main → master → develop) is a heuristic;
-  `-b <ref>` and the `b` key are the escape hatch.
+- **Branch scope = fork point, not upstream merge-base** (2026-07). The old
+  detection preferred the upstream tracking branch, so a pushed branch
+  (upstream = `origin/<same-branch>`) reviewed only *unpushed* commits —
+  usually nothing. The fork point (parent of the first commit only this
+  branch has, ignoring the branch's own remote copies) matches "review what
+  this branch introduces" regardless of what the trunk is called. Known
+  divergence: after merging the trunk *into* the branch, the merged-in trunk
+  changes appear in the diff (merge-base semantics would hide them) — use an
+  explicit base for that workflow. Explicit `-b <base>` and the base picker
+  keep merge-base semantics; the fork walk is capped at 10k own commits and
+  suggests `-b` past that.
 - **Unified diff is the default view**; side-by-side is a toggle, not the default,
   because unified survives narrow terminals (and will simplify comment anchoring
   later).

@@ -10,7 +10,7 @@ use crate::git::scope::Scope;
 pub enum ScopeAction {
     Open(Scope),
     PickCommit,
-    /// No base was auto-detected: choose one from the branch list.
+    /// Choose an explicit base from the branch list (merge-base semantics).
     PickBase,
 }
 
@@ -43,7 +43,7 @@ impl ScopePicker {
             match &item.action {
                 ScopeAction::Open(Scope::Uncommitted) => item.detail = count_label(uncommitted),
                 ScopeAction::Open(Scope::Staged) => item.detail = count_label(staged),
-                ScopeAction::Open(Scope::Branch { .. }) => {
+                ScopeAction::Open(Scope::BranchFork { .. }) => {
                     if let Some(n) = branch {
                         item.detail = count_label(n);
                     }

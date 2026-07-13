@@ -293,7 +293,7 @@ fn tree_order(a: &str, b: &str) -> std::cmp::Ordering {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::git::scope::{Scope, commit_scope, detect_base, file_count_fast};
+    use crate::git::scope::{Scope, commit_scope, file_count_fast, forkable_branch};
     use std::fs;
     use std::path::Path;
 
@@ -447,22 +447,101 @@ mod tests {
         assert_eq!(find(&result, "a.txt").status, FileStatus::Added);
     }
 
+    /// Commit one added file directly onto a ref, without touching HEAD or
+    /// the working tree — for advancing a branch we are not on.
+    fn commit_file_on(repo: &Repository, refname: &str, path: &str, content: &str, msg: &str) {
+        let parent = repo
+            .find_reference(refname)
+            .unwrap()
+            .peel_to_commit()
+            .unwrap();
+        let blob = repo.blob(content.as_bytes()).unwrap();
+        let mut builder = repo.treebuilder(Some(&parent.tree().unwrap())).unwrap();
+        builder.insert(path, blob, 0o100_644).unwrap();
+        let tree = repo.find_tree(builder.write().unwrap()).unwrap();
+        let sig = git2::Signature::now("test", "test@example.com").unwrap();
+        repo.commit(Some(refname), &sig, &sig, msg, &tree, &[&parent])
+            .unwrap();
+    }
+
     #[test]
-    fn base_detection_prefers_default_branches() {
+    fn fork_scope_reviews_all_branch_commits() {
         let (dir, repo) = setup();
-        // On main with no upstream and no other branches: nothing to compare to.
-        assert_eq!(detect_base(&repo), None);
-        // From a feature branch, main is found.
+        let main_ref = repo.head().unwrap().name().unwrap().to_string();
         let head = repo.head().unwrap().peel_to_commit().unwrap();
         repo.branch("feature", &head, false).unwrap();
         repo.set_head("refs/heads/feature").unwrap();
-        // Branch names depend on init.defaultBranch; accept either.
-        let base = detect_base(&repo);
-        assert!(
-            base.as_deref() == Some("main") || base.as_deref() == Some("master"),
-            "unexpected base: {base:?} (dir: {:?})",
-            dir.path()
+        fs::write(dir.path().join("feat.txt"), "feature work\n").unwrap();
+        commit_all(&repo, "feat 1");
+        fs::write(dir.path().join("a.txt"), "one\ntwo\nthree\nfeature\n").unwrap();
+        commit_all(&repo, "feat 2");
+
+        // Pushing the branch must not shrink the review: a remote copy at
+        // the branch tip is ignored (upstream-based detection got this
+        // wrong and reviewed only unpushed commits).
+        let tip = repo.head().unwrap().peel_to_commit().unwrap().id();
+        repo.reference("refs/remotes/origin/feature", tip, true, "push")
+            .unwrap();
+        // The trunk advancing afterwards must not leak into the review.
+        commit_file_on(
+            &repo,
+            &main_ref,
+            "trunk.txt",
+            "moved on\n",
+            "trunk advances",
         );
+
+        let scope = Scope::BranchFork {
+            branch: "feature".into(),
+        };
+        let result = load(&repo, &scope).unwrap();
+        assert_eq!(result.files.len(), 2, "both feature commits, nothing else");
+        assert_eq!(find(&result, "feat.txt").status, FileStatus::Added);
+        assert_eq!(find(&result, "a.txt").additions, 1);
+    }
+
+    #[test]
+    fn fork_scope_is_empty_for_branch_with_no_own_commits() {
+        let (_dir, repo) = setup();
+        let head = repo.head().unwrap().peel_to_commit().unwrap();
+        repo.branch("feature", &head, false).unwrap();
+        repo.set_head("refs/heads/feature").unwrap();
+        let scope = Scope::BranchFork {
+            branch: "feature".into(),
+        };
+        assert!(load(&repo, &scope).unwrap().files.is_empty());
+    }
+
+    #[test]
+    fn fork_scope_diffs_orphan_branch_against_empty_tree() {
+        let (dir, repo) = setup();
+        repo.set_head("refs/heads/orphan").unwrap(); // unborn: next commit is a root
+        fs::write(dir.path().join("solo.txt"), "orphan work\n").unwrap();
+        commit_all(&repo, "orphan root");
+        let scope = Scope::BranchFork {
+            branch: "orphan".into(),
+        };
+        let result = load(&repo, &scope).unwrap();
+        assert!(result.files.iter().all(|f| f.status == FileStatus::Added));
+        assert!(result.files.iter().any(|f| f.path == "solo.txt"));
+    }
+
+    #[test]
+    fn forkable_needs_another_branch_that_is_not_a_remote_copy() {
+        let (_dir, repo) = setup();
+        // Alone on the default branch: no fork point.
+        assert_eq!(forkable_branch(&repo), None);
+        // A remote copy of the same branch does not count.
+        let name = repo.head().unwrap().shorthand().unwrap().to_string();
+        let tip = repo.head().unwrap().peel_to_commit().unwrap().id();
+        repo.reference(&format!("refs/remotes/origin/{name}"), tip, true, "push")
+            .unwrap();
+        assert_eq!(forkable_branch(&repo), None);
+        // A real second branch does.
+        let head = repo.head().unwrap().peel_to_commit().unwrap();
+        repo.branch("feature", &head, false).unwrap();
+        repo.set_head("refs/heads/feature").unwrap();
+        assert_eq!(forkable_branch(&repo).as_deref(), Some("feature"));
     }
 
     #[test]

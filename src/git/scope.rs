@@ -8,8 +8,12 @@ pub enum Scope {
     Uncommitted,
     /// Index vs HEAD.
     Staged,
-    /// Merge-base of HEAD and `base` vs HEAD (the branch's own commits).
+    /// Merge-base of HEAD and an explicitly named `base` vs HEAD.
     Branch { base: String },
+    /// Everything the branch introduced: the commit right before its first
+    /// own commit (the fork point) vs HEAD. The fork point is recomputed on
+    /// every load, so it survives rebases and new commits.
+    BranchFork { branch: String },
     /// One commit vs its first parent.
     Commit { id: Oid, summary: String },
     /// Everything between two commits: tree(from) vs tree(to).
@@ -23,6 +27,7 @@ impl Scope {
             Scope::Uncommitted => "uncommitted changes".into(),
             Scope::Staged => "staged changes".into(),
             Scope::Branch { base } => format!("branch vs {base}"),
+            Scope::BranchFork { branch } => format!("{branch} vs fork point"),
             Scope::Commit { id, summary } => {
                 let mut s = summary.clone();
                 if s.chars().count() > 40 {
@@ -40,34 +45,125 @@ impl Scope {
             Scope::Uncommitted => "no uncommitted changes — working tree clean",
             Scope::Staged => "no staged changes",
             Scope::Branch { .. } => "no changes vs base — branch has no commits of its own",
+            Scope::BranchFork { .. } => {
+                "no changes since the fork point — branch has no commits of its own"
+            }
             Scope::Commit { .. } => "empty commit",
             Scope::Range { .. } => "no changes between these commits",
         }
     }
 }
 
-/// Pick a review base for the current branch: its upstream if set, else the
-/// first of main/master/develop that exists and isn't the current branch.
-pub fn detect_base(repo: &Repository) -> Option<String> {
-    let head = repo.head().ok()?;
-    let current = head.shorthand().ok().map(str::to_owned);
+/// Cap on how many branch-only commits the fork walk visits before giving
+/// up (degenerate histories: no ancestor shared with any other branch).
+const FORK_WALK_LIMIT: usize = 10_000;
 
-    if head.is_branch() {
-        let branch = git2::Branch::wrap(head);
-        if let Ok(upstream) = branch.upstream() {
-            if let Ok(Some(name)) = upstream.name() {
-                return Some(name.to_string());
+/// The current branch's name, when a fork point is definable: HEAD is on a
+/// branch and at least one other branch exists that isn't just a remote
+/// copy of this one. Cheap (ref lookups only) — safe on the UI thread.
+pub fn forkable_branch(repo: &Repository) -> Option<String> {
+    let head = repo.head().ok()?;
+    if !head.is_branch() {
+        return None;
+    }
+    let name = head.shorthand().ok()?.to_string();
+    if other_branch_tips(repo, &name).is_empty() {
+        return None;
+    }
+    Some(name)
+}
+
+/// Tips of every branch except `current` and its remote copies (same name
+/// under any remote, or its configured upstream). Pushing your branch must
+/// not make its commits look like they exist elsewhere.
+fn other_branch_tips(repo: &Repository, current: &str) -> Vec<Oid> {
+    let upstream = repo
+        .find_branch(current, git2::BranchType::Local)
+        .ok()
+        .and_then(|b| b.upstream().ok())
+        .and_then(|u| u.name().ok().flatten().map(str::to_owned));
+    let mut tips = Vec::new();
+    for branch_type in [git2::BranchType::Local, git2::BranchType::Remote] {
+        let Ok(branches) = repo.branches(Some(branch_type)) else {
+            continue;
+        };
+        for (branch, _) in branches.flatten() {
+            let Ok(Some(name)) = branch.name() else {
+                continue;
+            };
+            let skip = match branch_type {
+                git2::BranchType::Local => name == current,
+                git2::BranchType::Remote => {
+                    name.ends_with("/HEAD")
+                        || Some(name) == upstream.as_deref()
+                        || name.split_once('/').is_some_and(|(_, b)| b == current)
+                }
+            };
+            if !skip {
+                if let Some(tip) = branch.get().target() {
+                    tips.push(tip);
+                }
             }
         }
     }
+    tips
+}
 
-    ["main", "master", "develop"]
-        .iter()
-        .find(|&&name| {
-            Some(name) != current.as_deref()
-                && repo.find_branch(name, git2::BranchType::Local).is_ok()
-        })
-        .map(|&name| name.to_string())
+/// The commit right before the first commit `branch` introduced: walk HEAD's
+/// history with every other branch hidden; among the commits only this
+/// branch has, the earliest one's first parent is the fork point.
+///
+/// `Ok(Some(oid))` — review oid..HEAD (oid == HEAD when the branch has no
+/// commits of its own: the diff is honestly empty). `Ok(None)` — the
+/// branch's first own commit is a root: review against the empty tree.
+pub fn fork_point(repo: &Repository, branch: &str) -> Result<Option<Oid>> {
+    let head = repo
+        .head()
+        .context("resolving HEAD")?
+        .peel_to_commit()
+        .context("resolving HEAD commit")?;
+    let tips = other_branch_tips(repo, branch);
+    if tips.is_empty() {
+        return Err(anyhow!(
+            "no other branches to fork from — pick a base instead (-b <base>)"
+        ));
+    }
+    let mut walk = repo.revwalk().context("starting fork walk")?;
+    walk.push(head.id())?;
+    for tip in tips {
+        // A hide fails if the ref points at a missing object; skip those.
+        let _ = walk.hide(tip);
+    }
+    let mut own = std::collections::HashSet::new();
+    for oid in walk {
+        own.insert(oid?);
+        if own.len() > FORK_WALK_LIMIT {
+            return Err(anyhow!(
+                "no fork point within {FORK_WALK_LIMIT} commits — pick a base instead (-b <base>)"
+            ));
+        }
+    }
+    if own.is_empty() {
+        return Ok(Some(head.id()));
+    }
+    // The first own commit is one with no own parent (all shared). If the
+    // branch has several entry points (it merged two own lines), earliest
+    // commit time wins.
+    let mut first: Option<git2::Commit> = None;
+    for &oid in &own {
+        let commit = repo.find_commit(oid)?;
+        if commit.parent_ids().any(|p| own.contains(&p)) {
+            continue;
+        }
+        if first
+            .as_ref()
+            .is_none_or(|f| commit.time().seconds() < f.time().seconds())
+        {
+            first = Some(commit);
+        }
+    }
+    let first = first.expect("a non-empty own set has a first commit");
+    Ok(first.parent_ids().next())
 }
 
 /// Candidate review bases: every local and remote branch except the current
@@ -148,6 +244,19 @@ fn build_diff_with<'r>(
             let mb_tree = repo.find_commit(mb)?.tree()?;
             repo.diff_tree_to_tree(Some(&mb_tree), Some(&head.tree()?), Some(&mut opts))
                 .context("diffing merge base vs HEAD")?
+        }
+        Scope::BranchFork { branch } => {
+            let head = repo
+                .head()
+                .context("resolving HEAD")?
+                .peel_to_commit()
+                .context("resolving HEAD commit")?;
+            let fork_tree = match fork_point(repo, branch)? {
+                Some(oid) => Some(repo.find_commit(oid)?.tree()?),
+                None => None, // root commit is the branch's own: empty tree
+            };
+            repo.diff_tree_to_tree(fork_tree.as_ref(), Some(&head.tree()?), Some(&mut opts))
+                .context("diffing fork point vs HEAD")?
         }
         Scope::Commit { id, .. } => {
             let commit = repo.find_commit(*id).context("finding commit")?;
@@ -312,6 +421,14 @@ pub fn file_content(repo: &Repository, scope: &Scope, path: &str) -> Result<(Str
                     .tree()
                     .ok()?;
                 from_tree(&tree, base.clone())
+            }),
+        Scope::BranchFork { branch } => head_commit_tree()
+            .and_then(|t| from_tree(&t, "HEAD".into()))
+            .or_else(|| {
+                // Deleted on the branch: show the fork point's version.
+                let fork = fork_point(repo, branch).ok()??;
+                let tree = repo.find_commit(fork).ok()?.tree().ok()?;
+                from_tree(&tree, format!("{fork:.7}"))
             }),
         Scope::Commit { id, .. } => {
             let commit = repo.find_commit(*id).context("finding commit")?;

@@ -63,14 +63,13 @@ impl Args {
             return Ok(Some(Scope::Staged));
         }
         if let Some(base) = &self.branch {
-            let base = if base.is_empty() {
-                git::scope::detect_base(repo).context(
-                    "no review base found: set an upstream or pass one with --branch <BASE>",
-                )?
-            } else {
-                base.clone()
-            };
-            return Ok(Some(Scope::Branch { base }));
+            if base.is_empty() {
+                let branch = git::scope::forkable_branch(repo).context(
+                    "no fork point (no other branches) — pass a base with --branch <BASE>",
+                )?;
+                return Ok(Some(Scope::BranchFork { branch }));
+            }
+            return Ok(Some(Scope::Branch { base: base.clone() }));
         }
         if let Some(rev) = &self.rev {
             return Ok(Some(git::scope::rev_scope(repo, rev)?));
