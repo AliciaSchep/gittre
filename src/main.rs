@@ -4,7 +4,6 @@ mod event;
 mod git;
 mod keymap;
 mod ui;
-mod watch;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
@@ -38,11 +37,6 @@ struct Args {
     /// Repository path (defaults to the current directory)
     #[arg(short = 'C', long = "repo", default_value = ".", value_name = "PATH")]
     repo: std::path::PathBuf,
-
-    /// Disable auto-reload on repo changes (press r to reload manually).
-    /// Useful in very large repositories.
-    #[arg(long)]
-    no_watch: bool,
 }
 
 impl Args {
@@ -139,7 +133,7 @@ fn main() -> Result<()> {
         );
         prev_hook(info);
     }));
-    let result = app::App::new(repo, initial, !args.no_watch).run(&mut terminal);
+    let result = app::App::new(repo, initial).run(&mut terminal);
     let _ = ratatui::crossterm::execute!(
         std::io::stdout(),
         ratatui::crossterm::event::DisableMouseCapture,

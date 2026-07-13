@@ -22,7 +22,6 @@ use crate::ui::picker::{BasePicker, LogPicker, ScopeAction, ScopeItem, ScopePick
 use crate::ui::review::{CommentTarget, Stream};
 use crate::ui::tree::FileTree;
 use crate::ui::{bar, editor::TextEditor, export::ExportPreview, popups};
-use crate::watch::{self, RepoWatcher};
 
 #[derive(PartialEq, Clone, Copy)]
 enum Focus {
@@ -77,7 +76,6 @@ pub struct App {
     quit: bool,
     events: Receiver<AppEvent>,
     loader: Sender<LoadRequest>,
-    _watcher: Option<RepoWatcher>,
     /// Monotonic id pairing reload requests with responses.
     seq: u64,
     reloading: bool,
@@ -105,14 +103,6 @@ pub struct App {
     pending_key: Option<KeyPress>,
     /// Scroll offset of the `?` help popup; clamped at render time.
     help_scroll: u16,
-    /// The "reloads are slow, try --no-watch" hint fires at most once.
-    slow_hint_shown: bool,
-    /// A repo change arrived while a load was in flight; reload once after.
-    reload_queued: bool,
-    /// Watcher events before this instant are our own doing (git status /
-    /// diff write the index, e.g. the fsmonitor token) and must be ignored
-    /// or they'd form a reload feedback loop.
-    ignore_events_until: Option<Instant>,
 }
 
 struct CommentDraft {
@@ -146,16 +136,11 @@ pub fn debug_log(msg: &str) {
 impl App {
     /// `initial`: a scope pre-resolved (and validated) from CLI flags. Its
     /// diff loads on the background thread; the TUI appears immediately.
-    pub fn new(repo: Repository, initial: Option<Scope>, watch: bool) -> Self {
+    pub fn new(repo: Repository, initial: Option<Scope>) -> Self {
         let store = CommentStore::load(&repo);
         let (event_tx, events) = channel();
         let loader_path = repo.workdir().unwrap_or_else(|| repo.path()).to_path_buf();
-        let loader = spawn_loader(loader_path, event_tx.clone());
-        let watcher = if watch {
-            watch::spawn(&repo, event_tx)
-        } else {
-            None
-        };
+        let loader = spawn_loader(loader_path, event_tx);
         let screen = Screen::Picker(build_picker_skeleton(&repo));
         let mut app = App {
             repo,
@@ -165,7 +150,6 @@ impl App {
             quit: false,
             events,
             loader,
-            _watcher: watcher,
             seq: 0,
             reloading: false,
             reloaded_at: None,
@@ -181,9 +165,6 @@ impl App {
             undo_comments: Vec::new(),
             pending_key: None,
             help_scroll: 0,
-            slow_hint_shown: false,
-            reload_queued: false,
-            ignore_events_until: None,
         };
         match initial {
             Some(scope) => app.open_scope(scope),
@@ -220,8 +201,8 @@ impl App {
         Ok(())
     }
 
-    /// Suspend the TUI, run $EDITOR at file:line, resume. Any edits the
-    /// editor saves are picked up by the auto-reload watcher.
+    /// Suspend the TUI, run $EDITOR at file:line, resume, and refresh the
+    /// review after a successful editor exit.
     fn run_editor(&mut self, terminal: &mut DefaultTerminal, path: &std::path::Path, line: usize) {
         use ratatui::crossterm::event::{
             DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
@@ -264,7 +245,7 @@ impl App {
         let _ = terminal.clear();
 
         match status {
-            Ok(st) if st.success() => {}
+            Ok(st) if st.success() => self.request_reload(),
             Ok(st) => self.error = Some(format!("{editor} exited with {st}")),
             Err(e) => self.error = Some(format!("failed to launch {editor}: {e}")),
         }
@@ -382,54 +363,24 @@ impl App {
 
     fn on_app_event(&mut self, event: AppEvent) {
         match &event {
-            AppEvent::RepoChanged => debug_log(&format!("event: RepoChanged (seq={})", self.seq)),
-            AppEvent::DiffLoaded { seq, took, .. } => debug_log(&format!(
-                "event: DiffLoaded seq={seq} (cur={}) took={took:?}",
+            AppEvent::Diff { seq, took, .. } => debug_log(&format!(
+                "event: Diff seq={seq} (cur={}) took={took:?}",
                 self.seq
             )),
-            AppEvent::CountsLoaded { seq, .. } => {
-                debug_log(&format!("event: CountsLoaded seq={seq} (cur={})", self.seq))
+            AppEvent::Counts { seq, .. } => {
+                debug_log(&format!("event: Counts seq={seq} (cur={})", self.seq))
             }
-            AppEvent::FileLoaded {
+            AppEvent::File {
                 scope_label, path, ..
-            } => debug_log(&format!("event: FileLoaded {path} ({scope_label})")),
-        }
-        if matches!(event, AppEvent::RepoChanged)
-            && self
-                .ignore_events_until
-                .is_some_and(|until| Instant::now() < until)
-        {
-            debug_log("suppressed self-induced RepoChanged");
-            return;
+            } => debug_log(&format!("event: File {path} ({scope_label})")),
         }
         match event {
-            AppEvent::RepoChanged => match &self.screen {
-                Screen::Review(review) => {
-                    // Never stack reloads: on repos where a diff takes
-                    // seconds, a watcher storm would otherwise grind forever.
-                    if self.reloading {
-                        self.reload_queued = true;
-                        return;
-                    }
-                    self.seq += 1;
-                    self.reloading = true;
-                    let scope = review.scope.clone();
-                    let _ = self.loader.send(LoadRequest::Diff {
-                        seq: self.seq,
-                        scope,
-                    });
-                }
-                // Keep the picker's counts fresh too.
-                Screen::Picker(_) => self.request_counts(),
-                _ => {}
-            },
-            AppEvent::DiffLoaded {
+            AppEvent::Diff {
                 seq,
                 scope,
                 diff,
-                took,
+                took: _,
             } => {
-                self.ignore_events_until = Some(Instant::now() + Duration::from_millis(700));
                 if seq != self.seq {
                     return; // superseded by a newer request or scope switch
                 }
@@ -441,14 +392,6 @@ impl App {
                         return;
                     }
                 };
-                if took > Duration::from_secs(1) && self._watcher.is_some() && !self.slow_hint_shown
-                {
-                    self.slow_hint_shown = true;
-                    self.notice = Some(format!(
-                        "diff took {:.1}s — consider --no-watch (r reloads manually)",
-                        took.as_secs_f32()
-                    ));
-                }
                 match &mut self.screen {
                     // Same scope already open: this is a reload.
                     Screen::Review(review) if review.scope.label() == scope.label() => {
@@ -466,12 +409,11 @@ impl App {
                     }
                 }
             }
-            AppEvent::FileLoaded {
+            AppEvent::File {
                 scope_label,
                 path,
                 files,
             } => {
-                self.ignore_events_until = Some(Instant::now() + Duration::from_millis(700));
                 let loaded = match files {
                     Ok(f) => f,
                     Err(e) => {
@@ -496,8 +438,7 @@ impl App {
                 }
                 self.rebuild_review();
             }
-            AppEvent::CountsLoaded { seq, counts } => {
-                self.ignore_events_until = Some(Instant::now() + Duration::from_millis(700));
+            AppEvent::Counts { seq, counts } => {
                 if seq != self.seq {
                     return;
                 }
@@ -731,7 +672,11 @@ impl App {
             Screen::Review(review) => {
                 let t = keymap::REVIEW;
                 if review.diff.files.is_empty() {
-                    return vec![h(t, &[SwitchScope], "switch scope"), raw("?", "help")];
+                    return vec![
+                        h(t, &[Reload], "reload"),
+                        h(t, &[SwitchScope], "switch scope"),
+                        raw("?", "help"),
+                    ];
                 }
                 if review.file_view.is_some() {
                     let ft = keymap::FILE_VIEW;
@@ -780,9 +725,7 @@ impl App {
                     hints.push(h(t, &[NextHunk, PrevHunk], "hunk"));
                 }
                 hints.push(h(t, &[Search], "search"));
-                if self._watcher.is_none() {
-                    hints.push(h(t, &[Reload], "reload"));
-                }
+                hints.push(h(t, &[Reload], "reload"));
                 hints.push(h(t, &[Comment], "comment"));
                 if review.stream.has_comments() {
                     hints.push(h(t, &[NextComment, PrevComment], "comment nav"));
@@ -1286,15 +1229,7 @@ impl App {
             Action::CopyPatch if review.stream.has_selection() => self.copy_selection(true),
             Action::CopyCode | Action::CopyPatch => {}
             Action::FileView => self.open_file_view(),
-            Action::Reload => {
-                self.seq += 1;
-                self.reloading = true;
-                let scope = review.scope.clone();
-                let _ = self.loader.send(LoadRequest::Diff {
-                    seq: self.seq,
-                    scope,
-                });
-            }
+            Action::Reload => self.request_reload(),
             Action::ExportPreview => {
                 if self.store.comments.is_empty() {
                     self.error = Some("no comments to export".into());
@@ -1556,6 +1491,21 @@ impl App {
     /// Ask the loader for a scope's diff; the screen switches when it lands.
     fn open_scope(&mut self, scope: Scope) {
         self.seq += 1; // invalidate any in-flight response
+        self.reloading = true;
+        let _ = self.loader.send(LoadRequest::Diff {
+            seq: self.seq,
+            scope,
+        });
+    }
+
+    /// Reload the current review through the background worker. This is used
+    /// by the explicit `r` action and after returning from `$EDITOR`.
+    fn request_reload(&mut self) {
+        let Screen::Review(review) = &self.screen else {
+            return;
+        };
+        let scope = review.scope.clone();
+        self.seq += 1;
         self.reloading = true;
         let _ = self.loader.send(LoadRequest::Diff {
             seq: self.seq,

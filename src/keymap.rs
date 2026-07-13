@@ -472,7 +472,7 @@ pub static HELP: &[(&str, &[HelpItem])] = &[
             ),
             HelpItem::Act(&[FocusTree], "pick a file from the tree (Esc cancels)"),
             HelpItem::Act(&[ToggleTree], "show / hide the file tree"),
-            HelpItem::Act(&[Reload], "reload the diff now (see --no-watch)"),
+            HelpItem::Act(&[Reload], "reload the diff from the repository"),
             HelpItem::Act(&[SwitchScope], "switch scope (back to the picker)"),
         ],
     ),

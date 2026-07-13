@@ -19,7 +19,7 @@ scenario.json:
                                           # <ESC>[<0;COL;ROWM = click
                                           # (1-based), button 64/65 = wheel
     {"shell": "git commit -qam wip"},     # mutate the repo mid-run
-                                          # (exercises auto-reload)
+    {"send": "r", "wait": 0.5},          # explicitly reload
     {"resize": [60, 20], "wait": 0.5}
   ]
 }

@@ -41,10 +41,9 @@ right now:
 ```
 
 The review screen is one scrollable stream of every changed file, with a file
-tree alongside (`Tab` to jump via the tree, `t` to hide it). The view
-**reloads automatically** when files change, you commit, or switch branches —
-your reading position survives. In very large repositories, `--no-watch`
-disables that and `r` reloads on demand.
+tree alongside (`Tab` to jump via the tree, `t` to hide it). Press `r` to
+reload the diff after files, commits, or branches change; your reading position
+survives. Returning from the built-in `$EDITOR` handoff refreshes the diff too.
 
 The branch scope reviews everything the branch introduced: it diffs from the
 commit right before the branch's first own commit (its fork point), found
@@ -60,8 +59,8 @@ The keys are helix-friendly. `j`/`k` move the cursor (`gg`/`ge` top/bottom,
 `⌃d`/`⌃u` half page), `]`/`[` next/prev file, `n`/`p` next/prev hunk,
 `/` search (`n`/`N` between matches), `v` or `x` select + `y` copy code /
 `Y` copy patch, `o` view the full file, `E` open it in `$EDITOR` at the
-current line. Mouse works: wheel scrolls, click jumps. `?` shows everything
-else.
+current line, and `r` reload the diff. Mouse works: wheel scrolls, click jumps.
+`?` shows everything else.
 
 ### Commenting
 

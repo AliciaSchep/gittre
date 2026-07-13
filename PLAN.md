@@ -4,7 +4,7 @@ A terminal UI for **reviewing** git changes: read diffs, fast. It deliberately
 does *not* commit, stage, merge, stash, or push. Inspiration:
 [gitui](https://github.com/gitui-org/gitui) (always-visible command hints,
 keyboard-first) and [hunk](https://github.com/modem-dev/hunk) (review-first
-continuous diff stream, file sidebar, watch mode).
+continuous diff stream and file sidebar).
 
 Commenting + markdown export is the product differentiator: comments persist
 outside the worktree, follow code as it moves, render inline, and can be
@@ -20,7 +20,8 @@ previewed or exported as markdown.
   4. **Commit** — a single commit picked from a log list
 - Secondary scope: **commit range** (pick start/end in the log list). Nice-to-have, not v1-critical.
 - Continuous multi-file diff browsing (scroll through the whole changeset) *and* a file tree to jump to a specific file.
-- Automatic reload when the repo changes (working tree edits, index changes, new commits).
+- Explicit background reload with `r`, preserving the reader's position and
+  UI state; a successful `$EDITOR` handoff also requests a reload.
 - On-screen command bar at all times (gitui-style) plus a `?` help popup.
 
 **Out of scope (permanently, by design)**
@@ -110,16 +111,18 @@ Running `gittre` in a repo opens the **scope picker** — a simple menu, no flag
 - While a chord prefix is held, the command bar lists its completions
   (`gg top · ge bottom`); any other key cancels the chord.
 
-## 3. Auto-reload
+## 3. Reload model
 
-- `notify` (FSEvents on macOS) watches the working tree plus `.git/HEAD`,
-  `.git/index`, and `.git/refs/`.
-- Events are debounced (~250 ms) and trigger a background re-diff of the current
-  scope; the UI swaps in the new diff while preserving scroll position (by
-  file + hunk, not raw offset).
-- A subtle "reloaded" flash in the title bar; no full-screen disruption.
-- Watching applies to live scopes; fixed commit/range scopes only rewatch refs
-  (in case a ref is rewritten).
+- Reviews are snapshots. `r` explicitly requests a background re-diff of the
+  current scope; returning successfully from the sanctioned `$EDITOR` handoff
+  requests the same refresh.
+- The UI swaps in the new diff while preserving cursor/viewport position (by
+  file + offset), tree folds, search, focus, and comment anchors.
+- A subtle "reloading" / "reloaded" status appears in the title bar; the UI
+  remains responsive while git work runs.
+- Filesystem watching was removed in 2026-07. For this primarily personal tool,
+  its debounce/filter/storm policy and `.git/index` fsmonitor feedback loop were
+  not justified—especially because the main large-repo use case disabled it.
 
 ## 4. Architecture
 
@@ -129,7 +132,6 @@ Running `gittre` in a repo opens the **scope picker** — a simple menu, no flag
 | TUI framework | `ratatui` + `crossterm` |
 | Git access | `git2` (libgit2 — diffs, log, merge-base, status) |
 | Intraline word diff | `similar` |
-| File watching | `notify` + `notify-debouncer-mini` |
 | Syntax highlighting (M4) | `syntect` |
 | CLI args | `clap` |
 
@@ -148,13 +150,12 @@ src/
     tree.rs        // changed-files tree widget
     bar.rs         // contextual command bar
     popups.rs      // help (later: comment editor, export)
-  watch.rs         // notify wiring -> debounced ReloadRequested events
 ```
 
 **Concurrency model** — gitui-style, no async runtime: one worker thread does
-git work (diff/log can be slow on big repos) and sends results over a
-`crossbeam` channel that the event loop `select!`s alongside input and watcher
-events. The UI never blocks; a spinner shows while a diff loads.
+git work (diff/log can be slow on big repos) and sends results over a standard
+channel that the UI loop drains alongside terminal input. The UI never blocks;
+a spinner shows while a diff loads.
 
 **Performance guardrails** — diff lines are rendered virtualized (only the
 visible window is styled), syntax highlighting is per-visible-line with a
@@ -170,8 +171,10 @@ expand" row.
   the tool — get the diff rendering right before anything else.
 - **M2 — all scopes.** Scope picker, staged, branch-vs-base with auto base
   detection, commit log picker, `x` to switch. CLI shortcuts. Help popup.
-- **M3 — auto-reload.** Watcher, debounce, background re-diff, scroll
-  preservation. ✅
+- **M3 — reload infrastructure.** Background re-diff with stale-response
+  rejection and UI-state preservation. Originally included filesystem
+  watching; watching was removed in 2026-07, leaving explicit `r` and the
+  `$EDITOR` return refresh. ✅
 - **M4 — polish**, in priority order:
   1. ✅ **`/` search** across the diff stream. Smart-case; matches highlighted;
      while a search is live `n`/`N` walk matches and `Esc` clears it

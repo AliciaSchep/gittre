@@ -33,22 +33,20 @@ pub struct ScopeCounts {
 
 /// Everything the main loop can be woken up by besides key input.
 pub enum AppEvent {
-    /// The watcher saw a relevant change in the repo.
-    RepoChanged,
     /// The loader finished a diff. `seq` pairs it with its request; stale
     /// responses (seq mismatch) are dropped.
-    DiffLoaded {
+    Diff {
         seq: u64,
         scope: Scope,
         diff: Result<DiffResult>,
         took: Duration,
     },
-    CountsLoaded {
+    Counts {
         seq: u64,
         counts: ScopeCounts,
     },
     /// Expansion result: one or more files replacing the stub at `path`.
-    FileLoaded {
+    File {
         scope_label: String,
         path: String,
         files: Result<Vec<crate::git::diff::FileDiff>>,
@@ -95,7 +93,7 @@ pub fn spawn_loader(repo_path: PathBuf, events: Sender<AppEvent>) -> Sender<Load
                 } else {
                     diff::load_file(&repo, &scope, &path).map(|f| vec![f])
                 };
-                let event = AppEvent::FileLoaded {
+                let event = AppEvent::File {
                     scope_label: scope.label(),
                     path,
                     files,
@@ -108,7 +106,7 @@ pub fn spawn_loader(repo_path: PathBuf, events: Sender<AppEvent>) -> Sender<Load
             if let Some(LoadRequest::Diff { seq, scope }) = diff_req {
                 let start = Instant::now();
                 let diff = diff::load(&repo, &scope);
-                let event = AppEvent::DiffLoaded {
+                let event = AppEvent::Diff {
                     seq,
                     scope,
                     diff,
@@ -140,7 +138,7 @@ pub fn spawn_loader(repo_path: PathBuf, events: Sender<AppEvent>) -> Sender<Load
                         (branch, scope::file_count_fast(&repo, &scope))
                     }),
                 };
-                if events.send(AppEvent::CountsLoaded { seq, counts }).is_err() {
+                if events.send(AppEvent::Counts { seq, counts }).is_err() {
                     return;
                 }
             }
