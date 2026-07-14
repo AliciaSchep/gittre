@@ -96,13 +96,13 @@ fn main() -> Result<()> {
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| "repository".into());
         let date = app::today_string();
-        let md = comments::export_markdown(&store.comments, &title, &date);
+        let md = comments::export_markdown(store.comments(), &title, &date);
         match output {
             Some(path) => {
                 std::fs::write(path, md).with_context(|| format!("writing {}", path.display()))?;
                 eprintln!(
                     "exported {} comments to {}",
-                    store.comments.len(),
+                    store.comments().len(),
                     path.display()
                 );
             }

@@ -41,9 +41,10 @@ right now:
 ```
 
 The review screen is one scrollable stream of every changed file, with a file
-tree alongside (`Tab` to jump via the tree, `t` to hide it). Press `r` to
-reload the diff after files, commits, or branches change; your reading position
-survives. Returning from the built-in `$EDITOR` handoff refreshes the diff too.
+tree alongside (`Tab` to jump via the tree, `t` to hide it, `</>` to resize it,
+and `=` to restore automatic sizing). Press `r` to reload the diff after files,
+commits, or branches change; your reading position survives. Returning from the
+built-in `$EDITOR` handoff refreshes the diff too.
 
 The branch scope reviews everything the branch introduced: it diffs from the
 commit right before the branch's first own commit (its fork point), found
@@ -65,10 +66,12 @@ current line, and `r` reload the diff. Mouse works: wheel scrolls, click jumps.
 ### Commenting
 
 `c` comments on the cursor line (or the selection); comments render inline in
-the diff. They're anchored to the code *content*, GitHub-style: edit the file
-and they follow the lines they were written on; if the code disappears they
-turn **outdated** — kept, flagged, and shown with the original snippet rather
-than lost. Saved comments wrap and reflow with the diff pane. The comment
+the diff. Comment selections stay within one diff hunk so their stored snippet
+is contiguous; copy selections can still span the stream. Comments are anchored
+to the code *content*, GitHub-style: edit the file and they follow the lines
+they were written on; if the code disappears they turn **outdated** — kept,
+flagged, and shown with the original snippet rather than lost. Saved comments
+wrap and reflow with the diff pane. The comment
 editor follows the selected line, grows and scrolls as needed, and supports
 normal caret navigation; Enter saves and Alt+Enter adds a line. On a comment,
 `c` edits and `d` deletes (`u` undoes the last delete). `e` previews all

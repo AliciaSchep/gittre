@@ -27,6 +27,9 @@ previewed or exported as markdown.
 **Out of scope (permanently, by design)**
 - Committing, staging/unstaging, amending, merging, rebasing, branching, stashing, pushing/pulling.
 - Editing files.
+- External pager or difftool integration; gittre owns its review UI.
+- Mouse-driven pane resizing; keyboard sizing avoids terminal-specific drag
+  behavior and text-selection conflicts.
 
 ## 2. UX design
 
@@ -77,7 +80,7 @@ Running `gittre` in a repo opens the **scope picker** — a simple menu, no flag
 │                │                                             │
 └────────────────┴─────────────────────────────────────────────┘
  ↑↓/jk scroll  ]/[ file  n/p hunk  ⏎ tree/jump
- t tree  s split  q scope  ? help
+ t tree  </> width  = auto  q scope  ? help
 ```
 
 - **Right pane: the diff stream.** All changed files concatenated into one
@@ -89,13 +92,13 @@ Running `gittre` in a repo opens the **scope picker** — a simple menu, no flag
   passive — a "you are here" marker follows the diff. `Tab` activates it as a
   jump menu (selection seeded from the current file): `j/k` select, `Enter`
   opens a file (or toggles a directory), `Esc` cancels; control returns to the
-  diff after a jump. `t` hides/shows the pane.
+  diff after a jump. `t` hides/shows the pane; `</>` resize it in four-column
+  steps and `=` restores content-aware automatic sizing.
 - **Bottom command bar** always lists the actions valid *right now* (gitui's
   signature pattern). It changes with focus/mode; `?` opens a full help popup.
-- `s` toggles unified ↔ side-by-side (side-by-side only when the terminal is
-  wide enough; auto-fall-back to unified like hunk).
-- `q` (or `Esc` at the top layer) returns to the scope picker (state for the
-  previous scope is kept). `x` is helix's select-line, not an exit.
+- `q` (or `Esc` at the top layer) returns to the scope picker. Reloads within
+  a scope preserve review state; opening a scope starts a fresh review. `x` is
+  helix's select-line, not an exit.
 - Large files render lazily; binary files show a one-line "binary file changed" row.
 
 ### Keybindings (2026-07: helix-first, one table)
@@ -110,7 +113,7 @@ Running `gittre` in a repo opens the **scope picker** — a simple menu, no flag
   → action, with a guard for overloads (`n` is next-match while a search is
   live, next-hunk otherwise). Dispatch, the command-bar hints, and the `?`
   help popup all derive their key labels from the tables, so a rebind is a
-  one-line change. A future config file would parse into these same tables.
+  one-line change.
 - While a chord prefix is held, the command bar lists its completions
   (`gg top · ge bottom`); any other key cancels the chord.
 
@@ -136,8 +139,7 @@ Running `gittre` in a repo opens the **scope picker** — a simple menu, no flag
 | Concern | Crate |
 |---|---|
 | TUI framework | `ratatui` + `crossterm` |
-| Git access | `git2` (libgit2 — diffs, log, merge-base, status) |
-| Intraline word diff | `similar` |
+| Git access | `git2` for object data; the `git` CLI for worktree scopes |
 | Syntax highlighting (M4) | `syntect` |
 | CLI args | `clap` |
 
@@ -145,23 +147,26 @@ Running `gittre` in a repo opens the **scope picker** — a simple menu, no flag
 ```
 src/
   main.rs          // clap, terminal setup/teardown, panic hook
-  app.rs           // App state machine: ScopePicker | LogPicker | Review; event loop
-  event.rs         // input events + worker messages merged into one channel
+  app.rs           // screens, one active modal overlay, input routing, event loop
+  comments.rs      // persistent comments, re-anchoring, markdown export
+  event.rs         // background diff/count/file-expansion loader
   git/
-    scope.rs       // resolve ScopeKey -> (old tree, new tree/workdir), base detection
-    diff.rs        // load Diff -> Vec<FileDiff{ hunks, lines }>; runs on worker thread
+    cli.rs         // fast worktree diffs through the git CLI
+    scope.rs       // object-database scopes, file content, base detection
+    diff.rs        // git2 diff -> ordered DiffResult
     log.rs         // commit list for the pickers
   ui/
-    review.rs      // diff stream widget (virtualized scrolling)
+    review.rs      // diff stream, cursor/selection/search/comment positioning
     tree.rs        // changed-files tree widget
     bar.rs         // contextual command bar
-    popups.rs      // help (later: comment editor, export)
+    popups.rs      // help, comment editor, confirmations
 ```
 
-**Concurrency model** — gitui-style, no async runtime: one worker thread does
-git work (diff/log can be slow on big repos) and sends results over a standard
-channel that the UI loop drains alongside terminal input. The UI never blocks;
-a spinner shows while a diff loads.
+**Concurrency model** — no async runtime: one worker thread handles diff loads,
+scope counts, and lazy file expansion, then sends results over a standard
+channel that the UI loop drains between terminal events. Generation ids reject
+stale work. Capped commit/base pickers remain synchronous; diff computation
+never runs on the UI thread.
 
 **Performance guardrails** — diff lines are rendered virtualized (only the
 visible window is styled), syntax highlighting is per-visible-line with a
@@ -225,8 +230,8 @@ expand" row.
   with caret navigation and paste support; saved inline comments reflow with
   the diff pane; content-aware file tree that grows on wide terminals; exact
   markdown preview with scrolling, clipboard copy, and an explicit write step.
-  Drag-resizing the tree remains deferred, but pane sizing distinguishes
-  automatic from a future manual width.
+  The tree can be resized from the keyboard with `</>` and reset to automatic
+  sizing with `=`. Mouse dragging is permanently out of scope.
 
 Each milestone is shippable; M1–M3 is already a useful daily tool.
 
@@ -249,10 +254,10 @@ Each milestone is shippable; M1–M3 is already a useful daily tool.
   explicit base for that workflow. Explicit `-b <base>` and the base picker
   keep merge-base semantics; the fork walk is capped at 10k own commits and
   suggests `-b` past that.
-- **Unified diff is the default view**; side-by-side is a toggle, not the default,
-  because unified survives narrow terminals (and will simplify comment anchoring
-  later).
-- **No pager/difftool integration in v1** (hunk does this); revisit later.
+- **Unified diff is the only view.** Side-by-side remains explicitly deferred;
+  unified works at every terminal width and keeps comment placement simple.
+- **No external pager/difftool integration.** This is a permanent product
+  boundary, not deferred work; gittre owns its review UI.
 - Comment editing keeps Enter as save and Alt+Enter as newline because modified
   Enter keys are not reported consistently across terminal protocols.
 
@@ -270,21 +275,26 @@ loss.
   scope its anchor matches (comment on uncommitted work, still see it when
   reviewing the branch after committing). Scope at creation is metadata only.
 - **Anchoring:** file line numbers + snippet, never diff-row indices. The full
-  same-side snippet is matched, so a repeated final line cannot steal a
-  multi-line comment. Re-anchor cascade on every (re)load: exact (snippet still
-  at stored lines) → moved (snippet found elsewhere; position updated) → outdated
-  (collapsed "⚠ n outdated" row at the top of the file's section, expandable,
-  showing the preserved snippet).
+  same-side snippet is matched across consecutive lines within one hunk, so a
+  repeated final line or adjacent candidate rows from distant hunks cannot
+  steal a multi-line comment. Re-anchor cascade on every (re)load: exact
+  (snippet still at stored lines) → moved (snippet found elsewhere; position
+  updated) → outdated (collapsed "⚠ n outdated" row at the top of the file's
+  section, expandable, showing the preserved snippet).
 - **UX:** `v` select → `c` comment (Enter saves, Alt+Enter newline, Esc
-  cancels); bare `c` comments the current line. Inline blocks with a colored
-  gutter bar; counts in tree + title. `}`/`{` jump between comments; on a
-  comment: `c` edits, `d` deletes. `D` deletes **all** comments (confirm
-  prompt) to start a review anew; `u` restores whatever the last delete
-  removed (single or all). No resolve state for now (revisit later).
+  cancels); comment selections must stay within one file and hunk, while copy
+  selections may span the stream. Bare `c` comments the current line. Inline
+  blocks with a colored gutter bar; counts in tree + title. `}`/`{` jump
+  between comments; on a comment: `c` edits, `d` deletes. `D` deletes **all**
+  comments (confirm prompt) to start a review anew; `u` restores whatever the
+  last delete removed (single or all). No resolve state for now (revisit later).
 - **Storage:** JSON at `<gitdir>/gittre/comments.json` — never touches the
   working tree; linked worktrees get their own review (separate gitdir). Missing
   is an empty review, but unreadable/malformed stores are errors. Every mutation,
   including re-anchoring, persists atomically before changing in-memory state.
+  A re-anchor write failure never blocks a fresh diff: inline comments are
+  temporarily hidden with a persistent warning until placement can be saved
+  safely again.
 - **Export (M5.3):** markdown grouped by file — line refs, fenced snippet,
   body; outdated flagged. `e` opens an exact preview with copy/write actions;
   also `gittre export`.

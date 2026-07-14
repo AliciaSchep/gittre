@@ -99,10 +99,14 @@ pub fn reanchor(diff: &DiffResult, comments: &mut [Comment]) -> (Vec<Placed>, bo
         let movable = target.iter().any(|line| !line.trim().is_empty());
         if !target.is_empty() {
             for window in candidates.windows(target.len()) {
-                if !window
-                    .iter()
-                    .zip(&target)
-                    .all(|((_, _, _, content), expected)| *content == expected)
+                let contiguous = window.windows(2).all(|pair| {
+                    pair[0].1 == pair[1].1 && pair[0].0.checked_add(1) == Some(pair[1].0)
+                });
+                if !contiguous
+                    || !window
+                        .iter()
+                        .zip(&target)
+                        .all(|((_, _, _, content), expected)| *content == expected)
                 {
                     continue;
                 }
@@ -163,7 +167,7 @@ struct StoreFile {
 /// One comment pool per repo, persisted in the gitdir (never the worktree).
 pub struct CommentStore {
     path: PathBuf,
-    pub comments: Vec<Comment>,
+    comments: Vec<Comment>,
     next_id: u64,
 }
 
@@ -224,6 +228,7 @@ impl CommentStore {
         scope: String,
     ) -> Result<()> {
         let id = self.next_id;
+        let next_id = id.checked_add(1).context("comment id space exhausted")?;
         let mut comments = self.comments.clone();
         comments.push(Comment {
             id,
@@ -236,7 +241,7 @@ impl CommentStore {
             scope,
             outdated: false,
         });
-        self.commit_state(comments, id + 1)
+        self.commit_state(comments, next_id)
     }
 
     pub fn edit(&mut self, id: u64, body: String) -> Result<()> {
@@ -289,6 +294,10 @@ impl CommentStore {
 
     pub fn count_for_path(&self, path: &str) -> usize {
         self.comments.iter().filter(|c| c.path == path).count()
+    }
+
+    pub fn comments(&self) -> &[Comment] {
+        &self.comments
     }
 }
 
@@ -488,6 +497,55 @@ mod tests {
     }
 
     #[test]
+    fn multi_line_anchor_never_spans_hunks_or_line_gaps() {
+        let diff = DiffResult {
+            files: vec![FileDiff {
+                path: "a.rs".into(),
+                old_path: None,
+                status: FileStatus::Modified,
+                binary: false,
+                large: false,
+                byte_size: 0,
+                untracked_dir: false,
+                hunks: vec![
+                    Hunk {
+                        header: "@@ -40 +40 @@".into(),
+                        lines: vec![DiffLine {
+                            origin: '+',
+                            old_lineno: None,
+                            new_lineno: Some(40),
+                            content: "foo".into(),
+                        }],
+                    },
+                    Hunk {
+                        header: "@@ -400 +400 @@".into(),
+                        lines: vec![DiffLine {
+                            origin: '+',
+                            old_lineno: None,
+                            new_lineno: Some(400),
+                            content: "bar".into(),
+                        }],
+                    },
+                ],
+                additions: 2,
+                deletions: 0,
+            }],
+            additions: 2,
+            deletions: 0,
+        };
+        let mut c = comment("a.rs", 11);
+        c.lines = (10, 11);
+        c.snippet = vec!["+foo".into(), "+bar".into()];
+        let mut comments = [c];
+
+        let (placed, changed) = reanchor(&diff, &mut comments);
+
+        assert!(matches!(placed[0].anchor, Anchor::Outdated));
+        assert!(changed);
+        assert_eq!(comments[0].lines, (10, 11));
+    }
+
+    #[test]
     fn vanished_content_goes_outdated_and_can_recover() {
         let diff = diff_with("a.rs", &[10, 11]);
         let mut comments = [comment("a.rs", 99)];
@@ -600,6 +658,49 @@ mod tests {
             .err()
             .expect("malformed store fails");
         assert!(format!("{err:#}").contains("parsing"));
+    }
+
+    #[test]
+    fn exhausted_comment_ids_fail_without_creating_a_duplicate() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        let store_dir = repo.path().join("gittre");
+        fs::create_dir(&store_dir).unwrap();
+        let existing = Comment {
+            id: u64::MAX,
+            path: "a.rs".into(),
+            new_side: true,
+            lines: (1, 1),
+            snippet: vec!["+x".into()],
+            body: "existing".into(),
+            created_at: 0,
+            scope: "test".into(),
+            outdated: false,
+        };
+        fs::write(
+            store_dir.join("comments.json"),
+            serde_json::to_vec(&StoreFile {
+                next_id: u64::MAX,
+                comments: vec![existing],
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let mut store = CommentStore::load(&repo).unwrap();
+
+        let err = store
+            .add(
+                "b.rs".into(),
+                true,
+                (1, 1),
+                vec!["+y".into()],
+                "new".into(),
+                "test".into(),
+            )
+            .unwrap_err();
+
+        assert!(format!("{err:#}").contains("comment id space exhausted"));
+        assert_eq!(store.comments.len(), 1);
     }
 
     #[test]

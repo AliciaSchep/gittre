@@ -264,17 +264,24 @@ impl Stream {
         }
     }
 
-    /// Build a comment target from the active selection (single file only).
-    pub fn selection_target(&self, files: &[FileDiff]) -> Option<CommentTarget> {
-        let (lo, hi) = self.selection_range()?;
-        let mut target_file: Option<usize> = None;
+    /// Build a comment target from a contiguous selection. Copy selections
+    /// may span the stream, but a durable content anchor must stay within one
+    /// file and hunk.
+    pub fn selection_target(
+        &self,
+        files: &[FileDiff],
+    ) -> Result<Option<CommentTarget>, &'static str> {
+        let Some((lo, hi)) = self.selection_range() else {
+            return Ok(None);
+        };
+        let mut target_location: Option<(usize, usize)> = None;
         let mut new_nums: Vec<u32> = Vec::new();
         let mut old_nums: Vec<u32> = Vec::new();
         let mut snippet = Vec::new();
         for row in &self.rows[lo..=hi.min(self.rows.len() - 1)] {
             if let Row::Line(fi, hi_, li) = *row {
-                if *target_file.get_or_insert(fi) != fi {
-                    break; // clamp a cross-file selection to the first file
+                if *target_location.get_or_insert((fi, hi_)) != (fi, hi_) {
+                    return Err("comments must stay within one file and hunk");
                 }
                 let line = &files[fi].hunks[hi_].lines[li];
                 if let Some(n) = line.new_lineno {
@@ -286,19 +293,23 @@ impl Stream {
                 snippet.push(format!("{}{}", line.origin, line.content));
             }
         }
-        let fi = target_file?;
+        let Some((fi, _)) = target_location else {
+            return Ok(None);
+        };
         let (new_side, nums) = if new_nums.is_empty() {
             (false, old_nums)
         } else {
             (true, new_nums)
         };
-        let (&first, &last) = (nums.first()?, nums.last()?);
-        Some(CommentTarget {
+        let (Some(&first), Some(&last)) = (nums.first(), nums.last()) else {
+            return Ok(None);
+        };
+        Ok(Some(CommentTarget {
             path: files[fi].path.clone(),
             new_side,
             lines: (first, last),
             snippet,
-        })
+        }))
     }
 
     /// Target for a bare `c`: the first diff line at/below the cursor.
@@ -1073,6 +1084,29 @@ mod tests {
 
         assert_eq!(stream.scroll, 0, "cursor remains inside the first viewport");
         assert_eq!(stream.current_position(&diff.files), Some((0, Some(6))));
+    }
+
+    #[test]
+    fn comment_selection_rejects_cross_hunk_ranges() {
+        let mut file = file("a.rs", 1);
+        file.hunks.push(Hunk {
+            header: "@@ second @@".into(),
+            lines: vec![DiffLine {
+                origin: '+',
+                old_lineno: None,
+                new_lineno: Some(100),
+                content: "far away".into(),
+            }],
+        });
+        let diff = DiffResult::from_files(vec![file]);
+        let mut stream = Stream::new(&diff, &[], &[]);
+        stream.selection_anchor = Some(stream.hunk_starts[0] + 1);
+        stream.cursor = stream.hunk_starts[1] + 1;
+
+        assert!(matches!(
+            stream.selection_target(&diff.files),
+            Err("comments must stay within one file and hunk")
+        ));
     }
 
     #[test]
