@@ -42,8 +42,8 @@ struct ReviewState {
     show_tree: bool,
     /// Explicit width selected with `</>`; None uses content-aware sizing.
     tree_width: Option<u16>,
-    /// Effective width from the last frame, used as the next resize baseline.
-    rendered_tree_width: u16,
+    /// Full review width from the last frame, including a hidden tree.
+    rendered_review_width: u16,
     /// Full-file pager overlay (`o`).
     file_view: Option<FileView>,
 }
@@ -67,7 +67,7 @@ impl ReviewState {
                 focus: Focus::Stream,
                 show_tree: true,
                 tree_width: None,
-                rendered_tree_width: 0,
+                rendered_review_width: 0,
                 file_view: None,
             },
             warning,
@@ -217,6 +217,28 @@ struct CommentDraft {
     /// None when editing (anchor is kept from the original).
     target: Option<CommentTarget>,
     label: String,
+}
+
+enum SingleLineInput {
+    Continue,
+    Submit,
+    Cancel,
+}
+
+fn edit_single_line(input: &mut String, code: KeyCode) -> SingleLineInput {
+    match code {
+        KeyCode::Esc => SingleLineInput::Cancel,
+        KeyCode::Enter => SingleLineInput::Submit,
+        KeyCode::Backspace => {
+            input.pop();
+            SingleLineInput::Continue
+        }
+        KeyCode::Char(c) => {
+            input.push(c);
+            SingleLineInput::Continue
+        }
+        _ => SingleLineInput::Continue,
+    }
 }
 
 /// Append a line to $GITTRE_LOG if set — the TUI owns the terminal, so
@@ -369,12 +391,14 @@ impl App {
                     }
                     _ => {}
                 },
-                Overlay::ExportPreview(preview) => match mouse.kind {
-                    MouseEventKind::ScrollDown => preview.scroll_by(3),
-                    MouseEventKind::ScrollUp => preview.scroll_by(-3),
-                    _ => {}
-                },
-                Overlay::ConfirmClear | Overlay::Search(_) | Overlay::ExportPath { .. } => {}
+                Overlay::ExportPreview(preview) | Overlay::ExportPath { preview, .. } => {
+                    match mouse.kind {
+                        MouseEventKind::ScrollDown => preview.scroll_by(3),
+                        MouseEventKind::ScrollUp => preview.scroll_by(-3),
+                        _ => {}
+                    }
+                }
+                Overlay::ConfirmClear | Overlay::Search(_) => {}
             }
             if close {
                 self.overlay = None;
@@ -427,7 +451,9 @@ impl App {
                 if review.file_view.is_some() {
                     return;
                 }
-                if let Some(idx) = review.tree.hit(col, row) {
+                if review.show_tree
+                    && let Some(idx) = review.tree.hit(col, row)
+                {
                     review.tree.selected = idx;
                     if let Some(file_idx) = review.tree.activate() {
                         review.stream.jump_to_file(file_idx);
@@ -985,13 +1011,9 @@ impl App {
                 }
                 None
             }
-            Overlay::Search(mut input) => match key.code {
-                KeyCode::Esc => None,
-                KeyCode::Backspace => {
-                    input.pop();
-                    Some(Overlay::Search(input))
-                }
-                KeyCode::Enter => {
+            Overlay::Search(mut input) => match edit_single_line(&mut input, key.code) {
+                SingleLineInput::Cancel => None,
+                SingleLineInput::Submit => {
                     if !input.is_empty()
                         && let Screen::Review(review) = &mut self.screen
                     {
@@ -1005,45 +1027,35 @@ impl App {
                     }
                     None
                 }
-                KeyCode::Char(c) => {
-                    input.push(c);
-                    Some(Overlay::Search(input))
-                }
-                _ => Some(Overlay::Search(input)),
+                SingleLineInput::Continue => Some(Overlay::Search(input)),
             },
-            Overlay::ExportPath { mut path, preview } => match key.code {
-                KeyCode::Esc => Some(Overlay::ExportPreview(preview)),
-                KeyCode::Backspace => {
-                    path.pop();
-                    Some(Overlay::ExportPath { path, preview })
-                }
-                KeyCode::Enter if path.trim().is_empty() => {
-                    Some(Overlay::ExportPath { path, preview })
-                }
-                KeyCode::Enter => match std::fs::write(&path, preview.markdown()) {
-                    Ok(()) => {
-                        self.notice = Some(format!(
-                            "exported {} comment{} to {path}",
-                            self.store.comments().len(),
-                            if self.store.comments().len() == 1 {
-                                ""
-                            } else {
-                                "s"
-                            },
-                        ));
-                        None
-                    }
-                    Err(e) => {
-                        self.error = Some(format!("export failed: {e}"));
+            Overlay::ExportPath { mut path, preview } => {
+                match edit_single_line(&mut path, key.code) {
+                    SingleLineInput::Cancel => Some(Overlay::ExportPreview(preview)),
+                    SingleLineInput::Submit if path.trim().is_empty() => {
                         Some(Overlay::ExportPath { path, preview })
                     }
-                },
-                KeyCode::Char(c) => {
-                    path.push(c);
-                    Some(Overlay::ExportPath { path, preview })
+                    SingleLineInput::Submit => match std::fs::write(&path, preview.markdown()) {
+                        Ok(()) => {
+                            self.notice = Some(format!(
+                                "exported {} comment{} to {path}",
+                                self.store.comments().len(),
+                                if self.store.comments().len() == 1 {
+                                    ""
+                                } else {
+                                    "s"
+                                },
+                            ));
+                            None
+                        }
+                        Err(e) => {
+                            self.error = Some(format!("export failed: {e}"));
+                            Some(Overlay::ExportPath { path, preview })
+                        }
+                    },
+                    SingleLineInput::Continue => Some(Overlay::ExportPath { path, preview }),
                 }
-                _ => Some(Overlay::ExportPath { path, preview }),
-            },
+            }
             Overlay::ExportPreview(mut preview) => {
                 let mut close = false;
                 let mut write = false;
@@ -1423,9 +1435,20 @@ impl App {
                     review.focus = Focus::Stream;
                 }
             }
-            Action::NarrowTree => resize_tree(review, false),
-            Action::WidenTree => resize_tree(review, true),
-            Action::AutoTreeWidth => review.tree_width = None,
+            Action::NarrowTree => {
+                if let Some(message) = resize_notice(resize_tree(review, false)) {
+                    self.notice = Some(message.into());
+                }
+            }
+            Action::WidenTree => {
+                if let Some(message) = resize_notice(resize_tree(review, true)) {
+                    self.notice = Some(message.into());
+                }
+            }
+            Action::AutoTreeWidth => {
+                review.tree_width = None;
+                review.show_tree = true;
+            }
             Action::FocusTree => {
                 if !review.show_tree {
                     review.show_tree = true;
@@ -1709,6 +1732,7 @@ fn draw_review(
     hl: &Highlighter,
     comments: &[crate::comments::Comment],
 ) {
+    review.rendered_review_width = area.width;
     if let Some(view) = &review.file_view {
         view.render(frame, area);
         return;
@@ -1730,7 +1754,6 @@ fn draw_review(
 
     if review.show_tree {
         let tree_width = review_tree_width(review, area.width);
-        review.rendered_tree_width = tree_width;
         let [tree_area, stream_area] =
             Layout::horizontal([Constraint::Length(tree_width), Constraint::Min(0)]).areas(area);
         review
@@ -1770,14 +1793,60 @@ fn adaptive_tree_width(preferred: u16, manual: Option<u16>, available: u16) -> u
     desired.min(max_width)
 }
 
-fn resize_tree(review: &mut ReviewState, wider: bool) {
-    let current = review.rendered_tree_width.max(MIN_MANUAL_TREE_WIDTH);
-    review.tree_width = Some(if wider {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TreeResizeResult {
+    Changed(u16),
+    AtMinimum,
+    AtMaximum,
+    TerminalTooNarrow,
+}
+
+fn resized_tree_width(
+    preferred: u16,
+    manual: Option<u16>,
+    available: u16,
+    wider: bool,
+) -> TreeResizeResult {
+    let diff_cap = available.saturating_sub(MIN_DIFF_WIDTH).max(1);
+    if diff_cap < MIN_MANUAL_TREE_WIDTH {
+        return TreeResizeResult::TerminalTooNarrow;
+    }
+    let current = adaptive_tree_width(preferred, manual, available);
+    if wider && current >= diff_cap {
+        return TreeResizeResult::AtMaximum;
+    }
+    if !wider && current <= MIN_MANUAL_TREE_WIDTH {
+        return TreeResizeResult::AtMinimum;
+    }
+    let requested = if wider {
         current.saturating_add(TREE_RESIZE_STEP)
     } else {
         current.saturating_sub(TREE_RESIZE_STEP)
-    });
+    };
+    TreeResizeResult::Changed(adaptive_tree_width(preferred, Some(requested), available))
+}
+
+fn resize_tree(review: &mut ReviewState, wider: bool) -> TreeResizeResult {
     review.show_tree = true;
+    let result = resized_tree_width(
+        review.tree.preferred_width(),
+        review.tree_width,
+        review.rendered_review_width,
+        wider,
+    );
+    if let TreeResizeResult::Changed(width) = result {
+        review.tree_width = Some(width);
+    }
+    result
+}
+
+fn resize_notice(result: TreeResizeResult) -> Option<&'static str> {
+    match result {
+        TreeResizeResult::Changed(_) => None,
+        TreeResizeResult::AtMinimum => Some("tree is already at minimum width"),
+        TreeResizeResult::AtMaximum => Some("tree is already at maximum width"),
+        TreeResizeResult::TerminalTooNarrow => Some("terminal too narrow to resize panes"),
+    }
 }
 
 /// Keep the tree highlight in sync with the file at the top of the stream.
@@ -1793,11 +1862,15 @@ fn sync_tree(review: &mut ReviewState) {
 
 #[cfg(test)]
 mod layout_tests {
-    use super::{ReviewState, adaptive_tree_width};
+    use super::{
+        ReviewState, SingleLineInput, TreeResizeResult, adaptive_tree_width, edit_single_line,
+        resize_notice, resized_tree_width,
+    };
     use crate::comments::CommentStore;
     use crate::git::diff::{DiffLine, DiffResult, FileDiff, FileStatus, Hunk};
     use crate::git::scope::Scope;
     use git2::Repository;
+    use ratatui::crossterm::event::KeyCode;
 
     #[test]
     fn tree_grows_on_wide_screens_but_preserves_diff_space() {
@@ -1817,6 +1890,58 @@ mod layout_tests {
         assert_eq!(adaptive_tree_width(18, Some(180), 200), 140);
         assert_eq!(adaptive_tree_width(18, Some(8), 200), 16);
         assert_eq!(adaptive_tree_width(18, Some(40), 70), 10);
+    }
+
+    #[test]
+    fn resize_reports_each_width_limit_precisely() {
+        assert_eq!(
+            resized_tree_width(18, Some(40), 70, false),
+            TreeResizeResult::TerminalTooNarrow
+        );
+        assert_eq!(
+            resized_tree_width(18, Some(16), 200, false),
+            TreeResizeResult::AtMinimum
+        );
+        assert_eq!(
+            resized_tree_width(18, Some(140), 200, true),
+            TreeResizeResult::AtMaximum
+        );
+        assert_eq!(
+            resized_tree_width(18, None, 160, true),
+            TreeResizeResult::Changed(30)
+        );
+        assert_eq!(
+            resize_notice(TreeResizeResult::AtMinimum),
+            Some("tree is already at minimum width")
+        );
+        assert_eq!(
+            resize_notice(TreeResizeResult::AtMaximum),
+            Some("tree is already at maximum width")
+        );
+        assert_eq!(
+            resize_notice(TreeResizeResult::TerminalTooNarrow),
+            Some("terminal too narrow to resize panes")
+        );
+    }
+
+    #[test]
+    fn single_line_input_shares_edit_submit_and_cancel_behavior() {
+        let mut input = "ab".to_string();
+        assert!(matches!(
+            edit_single_line(&mut input, KeyCode::Backspace),
+            SingleLineInput::Continue
+        ));
+        assert_eq!(input, "a");
+        edit_single_line(&mut input, KeyCode::Char('z'));
+        assert_eq!(input, "az");
+        assert!(matches!(
+            edit_single_line(&mut input, KeyCode::Enter),
+            SingleLineInput::Submit
+        ));
+        assert!(matches!(
+            edit_single_line(&mut input, KeyCode::Esc),
+            SingleLineInput::Cancel
+        ));
     }
 
     #[test]

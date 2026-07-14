@@ -1,6 +1,6 @@
 [package]
 name = "gittre"
-version = "0.1.9"
+version = "0.1.10"
 edition = "2024"
 description = "A lean git review TUI: read diffs, comment, export to markdown"
 repository = "https://github.com/AliciaSchep/gittre"
