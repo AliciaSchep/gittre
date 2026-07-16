@@ -48,6 +48,14 @@ pub struct StreamAnchor {
     template_offset: usize,
     content_offset: usize,
     screen_offset: usize,
+    source: Option<SourceAnchor>,
+}
+
+#[derive(Clone, Debug)]
+struct SourceAnchor {
+    new_side: bool,
+    line: u32,
+    content: String,
 }
 
 struct SearchState {
@@ -310,6 +318,9 @@ impl Stream {
                     return Err("comments must stay within one file and hunk");
                 }
                 let line = &files[fi].hunks[hi_].lines[li];
+                if line.expanded_context {
+                    return Err("comments require a line in the original diff");
+                }
                 if let Some(n) = line.new_lineno {
                     new_nums.push(n);
                 }
@@ -345,6 +356,9 @@ impl Stream {
                 return None;
             };
             let line = &files[fi].hunks[hi].lines[li];
+            if line.expanded_context {
+                return None;
+            }
             let (new_side, n) = match (line.new_lineno, line.old_lineno) {
                 (Some(n), _) => (true, n),
                 (None, Some(n)) => (false, n),
@@ -357,6 +371,14 @@ impl Stream {
                 snippet: vec![format!("{}{}", line.origin, line.content)],
             })
         })
+    }
+
+    pub fn expanded_context_at_cursor(&self, files: &[FileDiff]) -> bool {
+        matches!(
+            self.rows.get(self.cursor),
+            Some(Row::Line(fi, hi, li, _, _))
+                if files[*fi].hunks[*hi].lines[*li].expanded_context
+        )
     }
 
     // ---- selection ---------------------------------------------------------
@@ -556,11 +578,31 @@ impl Stream {
         let fi = self.current_file()?;
         let origin = self.row_origins.get(self.cursor).copied()?;
         let template_start = self.template_file_start(fi)?;
+        let source = match self.rows.get(self.cursor) {
+            Some(Row::Line(row_fi, hi, li, _, _)) if *row_fi == fi => {
+                let line = &files[fi].hunks[*hi].lines[*li];
+                line.new_lineno
+                    .map(|number| SourceAnchor {
+                        new_side: true,
+                        line: number,
+                        content: line.content.clone(),
+                    })
+                    .or_else(|| {
+                        line.old_lineno.map(|number| SourceAnchor {
+                            new_side: false,
+                            line: number,
+                            content: line.content.clone(),
+                        })
+                    })
+            }
+            _ => None,
+        };
         Some(StreamAnchor {
             path: files[fi].path.clone(),
             template_offset: origin.template.saturating_sub(template_start),
             content_offset: origin.content_offset,
             screen_offset: self.cursor.saturating_sub(self.scroll),
+            source,
         })
     }
 
@@ -574,10 +616,65 @@ impl Stream {
             let end = self
                 .template_file_start(fi + 1)
                 .unwrap_or(self.template_rows.len());
-            let template = (start + anchor.template_offset).min(end.saturating_sub(1));
+            let semantic = anchor.source.as_ref().and_then(|source| {
+                let line_at = |row: &Row| {
+                    let Row::Line(row_fi, hi, li, _, _) = *row else {
+                        return None;
+                    };
+                    if row_fi != fi {
+                        return None;
+                    }
+                    let line = &files[fi].hunks[hi].lines[li];
+                    let number = if source.new_side {
+                        line.new_lineno
+                    } else {
+                        line.old_lineno
+                    }?;
+                    Some((number, &line.content))
+                };
+                let exact = self.template_rows[start..end]
+                    .iter()
+                    .position(|row| {
+                        line_at(row).is_some_and(|(number, content)| {
+                            number == source.line && content == &source.content
+                        })
+                    })
+                    .map(|offset| (start + offset, true));
+                exact
+                    .or_else(|| {
+                        self.template_rows[start..end]
+                            .iter()
+                            .position(|row| {
+                                line_at(row).is_some_and(|(number, _)| number == source.line)
+                            })
+                            .map(|offset| (start + offset, true))
+                    })
+                    .or_else(|| {
+                        self.template_rows[start..end]
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(offset, row)| {
+                                line_at(row).map(|(number, _)| {
+                                    (number.abs_diff(source.line), start + offset)
+                                })
+                            })
+                            .min_by_key(|(distance, _)| *distance)
+                            .map(|(_, template)| (template, false))
+                    })
+            });
+            let (template, exact_source) = semantic.unwrap_or_else(|| {
+                (
+                    (start + anchor.template_offset).min(end.saturating_sub(1)),
+                    false,
+                )
+            });
             let origin = RowOrigin {
                 template,
-                content_offset: anchor.content_offset,
+                content_offset: if exact_source {
+                    anchor.content_offset
+                } else {
+                    0
+                },
             };
             if let Some(row) = locate_origin(&self.row_origins, origin) {
                 self.cursor = row;
@@ -932,6 +1029,9 @@ impl Stream {
                 spans.push(f.path.clone().bold());
                 spans.push(format!("  +{} ", f.additions).green());
                 spans.push(format!("−{}", f.deletions).red());
+                if f.full_context {
+                    spans.push("  [full context]".cyan().bold());
+                }
                 let text_len: usize = spans.iter().map(|s| s.content.chars().count()).sum();
                 let pad = (width as usize).saturating_sub(text_len);
                 spans.push(" ".repeat(pad).into());
@@ -1104,6 +1204,7 @@ mod tests {
             large: false,
             byte_size: 0,
             untracked_dir: false,
+            full_context: false,
             hunks: vec![Hunk {
                 header: "@@ @@".into(),
                 lines: (0..lines)
@@ -1112,6 +1213,7 @@ mod tests {
                         old_lineno: None,
                         new_lineno: Some(i as u32 + 1),
                         content: format!("line {i}"),
+                        expanded_context: false,
                     })
                     .collect(),
             }],
@@ -1176,6 +1278,60 @@ mod tests {
     }
 
     #[test]
+    fn semantic_anchor_survives_full_context_expansion_and_collapse() {
+        let mut base_file = file("a.rs", 1);
+        base_file.hunks[0].lines[0].new_lineno = Some(20);
+        base_file.hunks[0].lines[0].content = "changed".into();
+        let base = DiffResult::from_files(vec![base_file.clone()]);
+        let mut stream = Stream::new(&base, &[], &[]);
+        stream.cursor = stream.hunk_starts[0] + 1;
+        let changed_anchor = stream.anchor(&base.files).unwrap();
+
+        let mut expanded_file = base_file;
+        expanded_file.full_context = true;
+        expanded_file.hunks[0].lines = (1..20)
+            .map(|number| DiffLine {
+                origin: ' ',
+                old_lineno: Some(number),
+                new_lineno: Some(number),
+                content: format!("line {number}"),
+                expanded_context: true,
+            })
+            .chain(std::iter::once(DiffLine {
+                origin: '+',
+                old_lineno: None,
+                new_lineno: Some(20),
+                content: "changed".into(),
+                expanded_context: false,
+            }))
+            .collect();
+        let expanded = DiffResult::from_files(vec![expanded_file]);
+        let mut stream = Stream::new(&expanded, &[], &[]);
+        stream.restore(&changed_anchor, &expanded.files);
+        assert_eq!(
+            stream.current_position(&expanded.files),
+            Some((0, Some(20)))
+        );
+
+        let context_row = stream
+            .rows
+            .iter()
+            .position(|row| {
+                matches!(
+                    row,
+                    Row::Line(0, 0, li, _, _)
+                        if expanded.files[0].hunks[0].lines[*li].new_lineno == Some(10)
+                )
+            })
+            .unwrap();
+        stream.cursor = context_row;
+        let context_anchor = stream.anchor(&expanded.files).unwrap();
+        let mut collapsed = Stream::new(&base, &[], &[]);
+        collapsed.restore(&context_anchor, &base.files);
+        assert_eq!(collapsed.current_position(&base.files), Some((0, Some(20))));
+    }
+
+    #[test]
     fn current_position_follows_cursor_not_viewport() {
         let diff = diff(&[("a.rs", 20)]);
         let mut stream = Stream::new(&diff, &[], &[]);
@@ -1196,6 +1352,7 @@ mod tests {
                 old_lineno: None,
                 new_lineno: Some(100),
                 content: "far away".into(),
+                expanded_context: false,
             }],
         });
         let diff = DiffResult::from_files(vec![file]);
@@ -1207,6 +1364,24 @@ mod tests {
             stream.selection_target(&diff.files),
             Err("comments must stay within one file and hunk")
         ));
+    }
+
+    #[test]
+    fn comments_reject_context_revealed_only_by_expansion() {
+        let mut expanded = file("a.rs", 1);
+        expanded.hunks[0].lines[0].origin = ' ';
+        expanded.hunks[0].lines[0].old_lineno = Some(1);
+        expanded.hunks[0].lines[0].expanded_context = true;
+        let diff = DiffResult::from_files(vec![expanded]);
+        let mut stream = Stream::new(&diff, &[], &[]);
+        stream.cursor = stream.hunk_starts[0] + 1;
+        stream.selection_anchor = Some(stream.cursor);
+
+        assert!(matches!(
+            stream.selection_target(&diff.files),
+            Err("comments require a line in the original diff")
+        ));
+        assert!(stream.expanded_context_at_cursor(&diff.files));
     }
 
     #[test]

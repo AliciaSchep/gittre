@@ -301,8 +301,23 @@ pub fn build_file_diff<'r>(
     scope: &Scope,
     path: &str,
 ) -> Result<git2::Diff<'r>> {
+    build_file_diff_with_context(repo, scope, path, None, 3)
+}
+
+/// Build one path with a caller-selected amount of unified context.
+pub fn build_file_diff_with_context<'r>(
+    repo: &'r Repository,
+    scope: &Scope,
+    path: &str,
+    old_path: Option<&str>,
+    context_lines: u32,
+) -> Result<git2::Diff<'r>> {
     let diff = build_diff_with(repo, scope, |opts| {
         opts.pathspec(path);
+        if let Some(old_path) = old_path.filter(|old_path| *old_path != path) {
+            opts.pathspec(old_path);
+        }
+        opts.context_lines(context_lines);
     })?;
     Ok(diff)
 }

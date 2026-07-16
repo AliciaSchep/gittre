@@ -102,6 +102,13 @@ Running `gittre` in a repo opens the **scope picker** — a simple menu, no flag
   a scope preserve review state; opening a scope starts a fresh review. `x` is
   helix's select-line, not an exit.
 - Large files render lazily; binary files show a one-line "binary file changed" row.
+- On a normal modified file, `Enter` toggles **inline full-file context**: the
+  whole file stays in the unified diff stream with additions and deletions
+  visible. This complements `o`, which remains a plain full-file pager. The
+  expansion is loaded per-file in the background, bounded to 4 MB, and can be
+  collapsed locally without another git operation. Added/deleted files are
+  already complete; binaries, untracked entries, and lazy stubs retain their
+  existing behavior.
 
 ### Keybindings (2026-07: helix-first, one table)
 
@@ -129,6 +136,10 @@ Running `gittre` in a repo opens the **scope picker** — a simple menu, no flag
 - Diff loads and lazy file expansions share a scope-generation id. Stale work
   is discarded before loading and stale responses can never splice into a
   newer review snapshot.
+- Inline full-context choices survive explicit reloads. Each expanded result is
+  checked against the canonical +/- lines from that review snapshot before it
+  is installed; a file that changed in flight requires `r` instead of mixing
+  two snapshots.
 - A subtle "reloading" / "reloaded" status appears in the title bar; the UI
   remains responsive while git work runs.
 - Filesystem watching was removed in 2026-07. For this primarily personal tool,
@@ -236,7 +247,10 @@ expand" row.
   copy, and an explicit write step. Clipboard writes prefer the desktop
   clipboard locally and use OSC 52 for SSH/fallback operation, with tmux
   passthrough. The tree can be resized from the keyboard with `</>` and reset
-  to automatic sizing with `=`. Mouse dragging is permanently out of scope.
+  to automatic sizing with `=`. `Enter` now expands/collapses a modified file
+  inline while retaining diff markers; the canonical three-line-context diff
+  remains the sole source for comment anchoring, so newly revealed unchanged
+  lines are read/search/copy-only. Mouse dragging is permanently out of scope.
 
 Each milestone is shippable; M1–M3 is already a useful daily tool.
 

@@ -29,6 +29,7 @@ pub struct Comment {
 }
 
 /// What a comment anchors to in the currently displayed diff.
+#[derive(Clone, Copy)]
 pub enum Anchor {
     /// After this (hunk, line) of the file.
     Line { hunk: usize, line: usize },
@@ -37,6 +38,7 @@ pub enum Anchor {
     Outdated,
 }
 
+#[derive(Clone, Copy)]
 pub struct Placed {
     pub comment: usize,
     pub file: usize,
@@ -156,6 +158,38 @@ pub fn reanchor(diff: &DiffResult, comments: &mut [Comment]) -> (Vec<Placed>, bo
         });
     }
     (placed, changed)
+}
+
+/// Translate canonical comment placements into a display diff that may have
+/// additional unchanged context. Only canonical placements decide whether a
+/// comment is current or outdated; expanded context cannot revive one.
+pub fn placements_for_display(
+    canonical: &DiffResult,
+    display: &DiffResult,
+    comments: &[Comment],
+    canonical_placed: &[Placed],
+) -> Vec<Placed> {
+    let mut display_comments = comments.to_vec();
+    let (display_placed, _) = reanchor(display, &mut display_comments);
+
+    canonical_placed
+        .iter()
+        .filter_map(|placed| match placed.anchor {
+            Anchor::Line { .. } => display_placed
+                .iter()
+                .find(|candidate| candidate.comment == placed.comment)
+                .copied(),
+            Anchor::Outdated => {
+                let path = &canonical.files.get(placed.file)?.path;
+                let file = display.files.iter().position(|f| &f.path == path)?;
+                Some(Placed {
+                    comment: placed.comment,
+                    file,
+                    anchor: Anchor::Outdated,
+                })
+            }
+        })
+        .collect()
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -364,6 +398,7 @@ mod tests {
                 large: false,
                 byte_size: 0,
                 untracked_dir: false,
+                full_context: false,
                 hunks: vec![Hunk {
                     header: "@@ @@".into(),
                     lines: new_linenos
@@ -373,6 +408,7 @@ mod tests {
                             old_lineno: None,
                             new_lineno: Some(n),
                             content: format!("line {n}"),
+                            expanded_context: false,
                         })
                         .collect(),
                 }],
@@ -423,6 +459,7 @@ mod tests {
                 large: false,
                 byte_size: 0,
                 untracked_dir: false,
+                full_context: false,
                 hunks: vec![Hunk {
                     header: "@@ @@".into(),
                     lines: [(13, "line 10"), (14, "line 11"), (15, "line 12")]
@@ -432,6 +469,7 @@ mod tests {
                             old_lineno: None,
                             new_lineno: Some(n),
                             content: c.into(),
+                            expanded_context: false,
                         })
                         .collect(),
                 }],
@@ -463,6 +501,7 @@ mod tests {
                 large: false,
                 byte_size: 0,
                 untracked_dir: false,
+                full_context: false,
                 hunks: vec![Hunk {
                     header: "@@ @@".into(),
                     lines: [(20, "other"), (21, "}"), (30, "unique"), (31, "}")]
@@ -472,6 +511,7 @@ mod tests {
                             old_lineno: None,
                             new_lineno: Some(n),
                             content: content.into(),
+                            expanded_context: false,
                         })
                         .collect(),
                 }],
@@ -507,6 +547,7 @@ mod tests {
                 large: false,
                 byte_size: 0,
                 untracked_dir: false,
+                full_context: false,
                 hunks: vec![
                     Hunk {
                         header: "@@ -40 +40 @@".into(),
@@ -515,6 +556,7 @@ mod tests {
                             old_lineno: None,
                             new_lineno: Some(40),
                             content: "foo".into(),
+                            expanded_context: false,
                         }],
                     },
                     Hunk {
@@ -524,6 +566,7 @@ mod tests {
                             old_lineno: None,
                             new_lineno: Some(400),
                             content: "bar".into(),
+                            expanded_context: false,
                         }],
                     },
                 ],
@@ -575,6 +618,7 @@ mod tests {
                 large: false,
                 byte_size: 0,
                 untracked_dir: false,
+                full_context: false,
                 hunks: vec![Hunk {
                     header: "@@ @@".into(),
                     lines: vec![DiffLine {
@@ -582,6 +626,7 @@ mod tests {
                         old_lineno: None,
                         new_lineno: Some(5),
                         content: String::new(),
+                        expanded_context: false,
                     }],
                 }],
                 additions: 1,
@@ -592,6 +637,18 @@ mod tests {
         };
         let mut comments = [c];
         let (placed, _) = reanchor(&diff, &mut comments);
+        assert!(matches!(placed[0].anchor, Anchor::Outdated));
+    }
+
+    #[test]
+    fn expanded_display_context_cannot_revive_an_outdated_comment() {
+        let canonical = diff_with("a.rs", &[1]);
+        let display = diff_with("a.rs", &[99]);
+        let mut comments = [comment("a.rs", 99)];
+        let (canonical_placed, _) = reanchor(&canonical, &mut comments);
+        assert!(matches!(canonical_placed[0].anchor, Anchor::Outdated));
+
+        let placed = placements_for_display(&canonical, &display, &comments, &canonical_placed);
         assert!(matches!(placed[0].anchor, Anchor::Outdated));
     }
 
@@ -751,6 +808,7 @@ mod tests {
                 large: false,
                 byte_size: 0,
                 untracked_dir: false,
+                full_context: false,
                 hunks: vec![Hunk {
                     header: "@@ @@".into(),
                     lines: vec![DiffLine {
@@ -758,6 +816,7 @@ mod tests {
                         old_lineno: None,
                         new_lineno: Some(14),
                         content: "line 11".into(),
+                        expanded_context: false,
                     }],
                 }],
                 additions: 1,

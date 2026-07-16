@@ -9,6 +9,12 @@ use git2::Repository;
 use crate::git::diff::{self, DiffResult};
 use crate::git::scope::{self, Scope};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FileLoadKind {
+    Stub { untracked_dir: bool },
+    FullContext,
+}
+
 /// Work for the background loader. Everything git-expensive runs there; the
 /// UI thread never computes a diff.
 pub enum LoadRequest {
@@ -21,7 +27,8 @@ pub enum LoadRequest {
         seq: u64,
         scope: Scope,
         path: String,
-        untracked_dir: bool,
+        old_path: Option<String>,
+        kind: FileLoadKind,
     },
 }
 
@@ -51,6 +58,7 @@ pub enum AppEvent {
         seq: u64,
         scope: Scope,
         path: String,
+        kind: FileLoadKind,
         files: Result<Vec<crate::git::diff::FileDiff>>,
     },
 }
@@ -161,22 +169,32 @@ pub fn spawn_loader(repo_path: PathBuf, events: Sender<AppEvent>) -> Sender<Load
                     seq,
                     scope,
                     path,
-                    untracked_dir,
+                    old_path,
+                    kind,
                 } = req
                 else {
                     continue;
                 };
-                let files = if untracked_dir {
-                    repo.workdir()
+                let files = match kind {
+                    FileLoadKind::Stub {
+                        untracked_dir: true,
+                    } => repo
+                        .workdir()
                         .ok_or_else(|| anyhow::anyhow!("no working directory"))
-                        .and_then(|wd| crate::git::cli::load_untracked_dir(wd, &path))
-                } else {
-                    diff::load_file(&repo, &scope, &path).map(|f| vec![f])
+                        .and_then(|wd| crate::git::cli::load_untracked_dir(wd, &path)),
+                    FileLoadKind::Stub {
+                        untracked_dir: false,
+                    } => diff::load_file(&repo, &scope, &path).map(|f| vec![f]),
+                    FileLoadKind::FullContext => {
+                        diff::load_file_full_context(&repo, &scope, &path, old_path.as_deref())
+                            .map(|f| vec![f])
+                    }
                 };
                 let event = AppEvent::File {
                     seq,
                     scope,
                     path,
+                    kind,
                     files,
                 };
                 if events.send(event).is_err() {
@@ -228,7 +246,10 @@ mod tests {
                 seq: 4,
                 scope: Scope::Uncommitted,
                 path: "src/lib.rs".into(),
-                untracked_dir: false,
+                old_path: None,
+                kind: FileLoadKind::Stub {
+                    untracked_dir: false,
+                },
             },
         );
         push_file_request(
@@ -237,7 +258,10 @@ mod tests {
                 seq: 4,
                 scope: Scope::Uncommitted,
                 path: "src/lib.rs".into(),
-                untracked_dir: true,
+                old_path: None,
+                kind: FileLoadKind::Stub {
+                    untracked_dir: true,
+                },
             },
         );
         push_file_request(
@@ -246,7 +270,8 @@ mod tests {
                 seq: 5,
                 scope: Scope::Uncommitted,
                 path: "src/lib.rs".into(),
-                untracked_dir: false,
+                old_path: Some("src/old.rs".into()),
+                kind: FileLoadKind::FullContext,
             },
         );
 
@@ -255,7 +280,9 @@ mod tests {
             requests[0],
             LoadRequest::File {
                 seq: 4,
-                untracked_dir: true,
+                kind: FileLoadKind::Stub {
+                    untracked_dir: true
+                },
                 ..
             }
         ));
@@ -273,13 +300,17 @@ mod tests {
                 seq: 2,
                 scope: Scope::Uncommitted,
                 path: "old.rs".into(),
-                untracked_dir: false,
+                old_path: None,
+                kind: FileLoadKind::Stub {
+                    untracked_dir: false,
+                },
             },
             LoadRequest::File {
                 seq: 3,
                 scope: Scope::Uncommitted,
                 path: "current.rs".into(),
-                untracked_dir: false,
+                old_path: None,
+                kind: FileLoadKind::FullContext,
             },
         ];
 

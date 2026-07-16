@@ -94,16 +94,33 @@ pub fn load_worktree(workdir: &Path, staged: bool) -> Result<DiffResult> {
 
 /// One file's diff, for expanding a large stub.
 pub fn load_worktree_file(workdir: &Path, staged: bool, path: &str) -> Result<FileDiff> {
+    load_worktree_file_with_context(workdir, staged, path, None, 3)
+}
+
+/// One file with an explicit unified-context width. Used by inline full-file
+/// expansion without paying for another untracked scan.
+pub fn load_worktree_file_with_context(
+    workdir: &Path,
+    staged: bool,
+    path: &str,
+    old_path: Option<&str>,
+    context_lines: u32,
+) -> Result<FileDiff> {
     // Untracked files aren't in `git diff`; synthesize from disk.
     if !staged && is_untracked(workdir, path)? {
         return untracked_file(workdir, path, u64::MAX);
     }
     let mut cmd = git(workdir);
     cmd.args(["diff", "--no-color", "--no-ext-diff", "-M", "-p"]);
+    cmd.arg(format!("--unified={context_lines}"));
     if staged {
         cmd.arg("--cached");
     }
-    cmd.args(["HEAD", "--"]).arg(path);
+    cmd.args(["HEAD", "--"]);
+    if let Some(old_path) = old_path.filter(|old_path| *old_path != path) {
+        cmd.arg(old_path);
+    }
+    cmd.arg(path);
     let patch = run(cmd, "single-file diff")?;
     parse_patch(&patch)
         .into_iter()
@@ -212,6 +229,7 @@ fn untracked_dir_stub(dir: &str) -> FileDiff {
         large: false,
         byte_size: 0,
         untracked_dir: true,
+        full_context: false,
         hunks: Vec::new(),
         additions: 0,
         deletions: 0,
@@ -264,6 +282,7 @@ fn untracked_file(workdir: &Path, path: &str, cap: u64) -> Result<FileDiff> {
         large: byte_size > cap,
         byte_size,
         untracked_dir: false,
+        full_context: false,
         hunks: Vec::new(),
         additions: 0,
         deletions: 0,
@@ -285,6 +304,7 @@ fn untracked_file(workdir: &Path, path: &str, cap: u64) -> Result<FileDiff> {
             old_lineno: None,
             new_lineno: Some(i as u32 + 1),
             content: l.to_string(),
+            expanded_context: false,
         })
         .collect();
     file.additions = lines.len();
@@ -340,6 +360,7 @@ pub fn parse_patch(text: &str) -> Vec<FileDiff> {
                 large: false,
                 byte_size: 0,
                 untracked_dir: false,
+                full_context: false,
                 hunks: Vec::new(),
                 additions: 0,
                 deletions: 0,
@@ -363,6 +384,7 @@ pub fn parse_patch(text: &str) -> Vec<FileDiff> {
                         old_lineno: Some(old_ln),
                         new_lineno: Some(new_ln),
                         content: line[1..].to_string(),
+                        expanded_context: false,
                     });
                     old_ln += 1;
                     new_ln += 1;
@@ -375,6 +397,7 @@ pub fn parse_patch(text: &str) -> Vec<FileDiff> {
                         old_lineno: Some(old_ln),
                         new_lineno: None,
                         content: line[1..].to_string(),
+                        expanded_context: false,
                     });
                     old_ln += 1;
                     file.deletions += 1;
@@ -386,6 +409,7 @@ pub fn parse_patch(text: &str) -> Vec<FileDiff> {
                         old_lineno: None,
                         new_lineno: Some(new_ln),
                         content: line[1..].to_string(),
+                        expanded_context: false,
                     });
                     new_ln += 1;
                     file.additions += 1;

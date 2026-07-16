@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use anyhow::{Context, Result};
 use git2::{Delta, Repository};
 
@@ -9,6 +11,9 @@ pub struct DiffLine {
     pub old_lineno: Option<u32>,
     pub new_lineno: Option<u32>,
     pub content: String,
+    /// Unchanged line revealed only by inline full-file context. It remains
+    /// readable/copyable but is not a durable comment target.
+    pub expanded_context: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -53,12 +58,14 @@ pub struct FileDiff {
     pub byte_size: u64,
     /// An untracked directory (collapsed, GitHub-style); Enter lists it.
     pub untracked_dir: bool,
+    /// This display override contains the entire file around its changes.
+    pub full_context: bool,
     pub hunks: Vec<Hunk>,
     pub additions: usize,
     pub deletions: usize,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct DiffResult {
     pub files: Vec<FileDiff>,
     pub additions: usize,
@@ -154,6 +161,124 @@ pub fn load_file(repo: &Repository, scope: &super::scope::Scope, path: &str) -> 
         .ok_or_else(|| anyhow::anyhow!("'{path}' no longer in the diff"))
 }
 
+/// Load one file with enough unified context to show its complete contents
+/// inline. The request is explicit but still bounded to protect the stream.
+pub fn load_file_full_context(
+    repo: &Repository,
+    scope: &super::scope::Scope,
+    path: &str,
+    old_path: Option<&str>,
+) -> Result<FileDiff> {
+    use super::scope::Scope;
+    const MAX_INLINE_BYTES: usize = 4 * 1024 * 1024;
+    // An accepted file cannot contain more lines than bytes. Matching the
+    // byte budget therefore covers the whole file without overflowing git's
+    // hunk-range arithmetic at u32::MAX.
+    const FULL_CONTEXT_LINES: u32 = MAX_INLINE_BYTES as u32;
+
+    let mut file = if let (Some(workdir), Some(staged)) = (
+        repo.workdir(),
+        match scope {
+            Scope::Uncommitted => Some(false),
+            Scope::Staged => Some(true),
+            _ => None,
+        },
+    ) {
+        super::cli::load_worktree_file_with_context(
+            workdir,
+            staged,
+            path,
+            old_path,
+            FULL_CONTEXT_LINES,
+        )?
+    } else {
+        let diff = super::scope::build_file_diff_with_context(
+            repo,
+            scope,
+            path,
+            old_path,
+            FULL_CONTEXT_LINES,
+        )?;
+        collect(&diff)?
+            .files
+            .into_iter()
+            .find(|f| f.path == path)
+            .ok_or_else(|| anyhow::anyhow!("'{path}' no longer in the diff"))?
+    };
+
+    let rendered_bytes: usize = file
+        .hunks
+        .iter()
+        .flat_map(|hunk| &hunk.lines)
+        .map(|line| line.content.len().saturating_add(1))
+        .sum();
+    if rendered_bytes > MAX_INLINE_BYTES {
+        anyhow::bail!(
+            "'{path}' is too large for inline full context ({rendered_bytes} bytes); press o for the file view"
+        );
+    }
+    file.large = false;
+    file.full_context = true;
+    Ok(file)
+}
+
+/// A context-only reload must describe the same snapshot. Hunk headers and
+/// unchanged lines may differ, but the actual +/- lines must be identical.
+pub fn same_changes(base: &FileDiff, expanded: &FileDiff) -> bool {
+    if base.path != expanded.path
+        || base.old_path != expanded.old_path
+        || base.status != expanded.status
+        || base.binary != expanded.binary
+        || base.additions != expanded.additions
+        || base.deletions != expanded.deletions
+    {
+        return false;
+    }
+    changed_lines(base) == changed_lines(expanded)
+}
+
+/// Mark unchanged lines that exist only because full context was requested.
+pub fn mark_expanded_context(base: &FileDiff, expanded: &mut FileDiff) {
+    let base_lines: HashSet<(char, Option<u32>, Option<u32>, &str)> = base
+        .hunks
+        .iter()
+        .flat_map(|hunk| &hunk.lines)
+        .map(|line| {
+            (
+                line.origin,
+                line.old_lineno,
+                line.new_lineno,
+                line.content.as_str(),
+            )
+        })
+        .collect();
+    for line in expanded.hunks.iter_mut().flat_map(|hunk| &mut hunk.lines) {
+        line.expanded_context = line.origin == ' '
+            && !base_lines.contains(&(
+                line.origin,
+                line.old_lineno,
+                line.new_lineno,
+                line.content.as_str(),
+            ));
+    }
+}
+
+fn changed_lines(file: &FileDiff) -> Vec<(char, Option<u32>, Option<u32>, &str)> {
+    file.hunks
+        .iter()
+        .flat_map(|hunk| &hunk.lines)
+        .filter(|line| matches!(line.origin, '+' | '-'))
+        .map(|line| {
+            (
+                line.origin,
+                line.old_lineno,
+                line.new_lineno,
+                line.content.as_str(),
+            )
+        })
+        .collect()
+}
+
 fn collect(diff: &git2::Diff) -> Result<DiffResult> {
     // The foreach callbacks all need mutable access to the same accumulator.
     let result = std::cell::RefCell::new(DiffResult::default());
@@ -196,6 +321,7 @@ fn collect(diff: &git2::Diff) -> Result<DiffResult> {
                 large: over_cap,
                 byte_size,
                 untracked_dir: false,
+                full_context: false,
                 hunks: Vec::new(),
                 additions: 0,
                 deletions: 0,
@@ -249,6 +375,7 @@ fn collect(diff: &git2::Diff) -> Result<DiffResult> {
                         content: String::from_utf8_lossy(line.content())
                             .trim_end_matches(['\n', '\r'])
                             .to_string(),
+                        expanded_context: false,
                     });
                 }
             }
@@ -616,6 +743,87 @@ mod tests {
             ]
         );
         assert_eq!(tree_order("a.txt", "a.txt"), Ordering::Equal);
+    }
+
+    #[test]
+    fn full_context_preserves_changes_and_marks_only_revealed_lines() {
+        let (dir, repo) = setup();
+        let original = (1..=40)
+            .map(|line| format!("line {line}\n"))
+            .collect::<String>();
+        fs::write(dir.path().join("a.txt"), &original).unwrap();
+        commit_all(&repo, "long file");
+        let changed = original
+            .replace("line 2\n", "changed 2\n")
+            .replace("line 39\n", "changed 39\n");
+        fs::write(dir.path().join("a.txt"), changed).unwrap();
+
+        let base = find(&load_uncommitted(&repo).unwrap(), "a.txt").clone();
+        assert!(
+            !base
+                .hunks
+                .iter()
+                .flat_map(|hunk| &hunk.lines)
+                .any(|line| line.content == "line 20")
+        );
+        let mut expanded =
+            load_file_full_context(&repo, &Scope::Uncommitted, "a.txt", None).unwrap();
+
+        assert!(same_changes(&base, &expanded));
+        mark_expanded_context(&base, &mut expanded);
+        let middle = expanded
+            .hunks
+            .iter()
+            .flat_map(|hunk| &hunk.lines)
+            .find(|line| line.content == "line 20")
+            .expect("full context contains unchanged middle");
+        assert!(middle.expanded_context);
+        assert!(
+            expanded
+                .hunks
+                .iter()
+                .flat_map(|hunk| &hunk.lines)
+                .filter(|line| matches!(line.origin, '+' | '-'))
+                .all(|line| !line.expanded_context)
+        );
+    }
+
+    #[test]
+    fn full_context_preserves_a_renamed_file() {
+        let (dir, repo) = setup();
+        let original = (1..=40)
+            .map(|line| format!("line {line}\n"))
+            .collect::<String>();
+        fs::write(dir.path().join("old.txt"), &original).unwrap();
+        commit_all(&repo, "rename source");
+        fs::rename(dir.path().join("old.txt"), dir.path().join("new.txt")).unwrap();
+        fs::write(
+            dir.path().join("new.txt"),
+            original.replace("line 20\n", "changed 20\n"),
+        )
+        .unwrap();
+        let mut index = repo.index().unwrap();
+        index.remove_path(Path::new("old.txt")).unwrap();
+        index.add_path(Path::new("new.txt")).unwrap();
+        index.write().unwrap();
+
+        let result = load(&repo, &Scope::Staged).unwrap();
+        let base = find(&result, "new.txt");
+        assert_eq!(base.status, FileStatus::Renamed);
+        assert_eq!(base.old_path.as_deref(), Some("old.txt"));
+        let expanded =
+            load_file_full_context(&repo, &Scope::Staged, "new.txt", base.old_path.as_deref())
+                .unwrap();
+
+        assert!(expanded.full_context);
+        assert!(same_changes(base, &expanded));
+        assert!(
+            expanded
+                .hunks
+                .iter()
+                .flat_map(|hunk| &hunk.lines)
+                .any(|line| line.content == "line 35")
+        );
     }
 
     #[test]

@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, Instant};
 
@@ -11,9 +12,9 @@ use ratatui::prelude::*;
 use ratatui::widgets::Paragraph;
 
 use crate::clipboard;
-use crate::comments::{Comment, CommentStore, export_markdown};
-use crate::event::{AppEvent, LoadRequest, ScopeCounts, spawn_loader};
-use crate::git::diff::DiffResult;
+use crate::comments::{Comment, CommentStore, export_markdown, placements_for_display};
+use crate::event::{AppEvent, FileLoadKind, LoadRequest, ScopeCounts, spawn_loader};
+use crate::git::diff::{self, DiffResult, FileDiff, FileStatus};
 use crate::git::log::commit_log;
 use crate::git::scope::{Scope, base_candidates, file_content, forkable_branch};
 use crate::keymap::{self, Action, KeyPress, Lookup};
@@ -47,6 +48,30 @@ struct ReviewState {
     rendered_review_width: u16,
     /// Full-file pager overlay (`o`).
     file_view: Option<FileView>,
+    /// Canonical file diffs hidden behind inline full-context display
+    /// overrides. Presence means the user wants the file expanded; loading
+    /// distinguishes an outstanding background request from an installed
+    /// override.
+    full_context: HashMap<String, FullContextState>,
+}
+
+struct FullContextState {
+    base: FileDiff,
+    loading: bool,
+}
+
+enum FullContextToggle {
+    Load {
+        path: String,
+        old_path: Option<String>,
+    },
+    Collapsed(Option<String>),
+    Unavailable,
+}
+
+enum FullContextInstall {
+    Installed(Option<String>),
+    Ignored,
 }
 
 #[derive(Default)]
@@ -58,7 +83,8 @@ struct ReviewViewState {
 
 impl ReviewState {
     fn new(scope: Scope, diff: DiffResult, store: &mut CommentStore) -> (Self, Option<String>) {
-        let (stream, tree, warning) = Self::build_views(&diff, store, &ReviewViewState::default());
+        let (stream, tree, warning) =
+            Self::build_views(&diff, &diff, store, &ReviewViewState::default());
         (
             ReviewState {
                 scope,
@@ -70,6 +96,7 @@ impl ReviewState {
                 tree_width: None,
                 rendered_review_width: 0,
                 file_view: None,
+                full_context: HashMap::new(),
             },
             warning,
         )
@@ -78,16 +105,43 @@ impl ReviewState {
     /// Re-place comments and rebuild the views while preserving reader state.
     fn rebuild(&mut self, store: &mut CommentStore) -> Option<String> {
         let view = self.capture_view();
-        let (stream, tree, warning) = Self::build_views(&self.diff, store, &view);
+        let canonical = self.canonical_diff();
+        let (stream, tree, warning) = Self::build_views(&canonical, &self.diff, store, &view);
         self.install_views(stream, tree);
         warning
     }
 
     /// Swap in a freshly loaded diff while preserving reader state. Comment
     /// persistence failures hide inline comments but never block review.
-    fn replace_diff(&mut self, diff: DiffResult, store: &mut CommentStore) -> Option<String> {
+    fn replace_diff(
+        &mut self,
+        diff: DiffResult,
+        store: &mut CommentStore,
+    ) -> (Option<String>, Vec<(String, Option<String>)>) {
         let view = self.capture_view();
-        self.install_diff(diff, store, &view)
+        let wanted: Vec<String> = self.full_context.keys().cloned().collect();
+        self.full_context.clear();
+        for path in wanted {
+            if let Some(file) = diff
+                .files
+                .iter()
+                .find(|file| file.path == path && full_context_eligible(file))
+            {
+                self.full_context.insert(
+                    path,
+                    FullContextState {
+                        base: file.clone(),
+                        loading: true,
+                    },
+                );
+            }
+        }
+        let requests = self
+            .full_context
+            .iter()
+            .map(|(path, state)| (path.clone(), state.base.old_path.clone()))
+            .collect();
+        (self.install_diff(diff, store, &view), requests)
     }
 
     /// Replace a lazy stub without cloning every other file in the review.
@@ -117,37 +171,151 @@ impl ReviewState {
         store: &mut CommentStore,
         view: &ReviewViewState,
     ) -> Option<String> {
-        let (stream, tree, warning) = Self::build_views(&diff, store, view);
+        let canonical = self.canonical_diff_for(&diff);
+        let (stream, tree, warning) = Self::build_views(&canonical, &diff, store, view);
         self.diff = diff;
         self.install_views(stream, tree);
         warning
     }
 
     fn build_views(
-        diff: &DiffResult,
+        canonical: &DiffResult,
+        display: &DiffResult,
         store: &mut CommentStore,
         view: &ReviewViewState,
     ) -> (Stream, FileTree, Option<String>) {
-        let (placed, counts, warning) = match store.reanchor(diff) {
-            Ok(placed) => (placed, comment_counts(diff, store), None),
+        let (placed, counts, warning) = match store.reanchor(canonical) {
+            Ok(canonical_placed) => (
+                placements_for_display(canonical, display, store.comments(), &canonical_placed),
+                comment_counts(display, store),
+                None,
+            ),
             Err(e) => (
                 Vec::new(),
-                vec![0; diff.files.len()],
+                vec![0; display.files.len()],
                 Some(format!(
                     "inline comments hidden; anchor updates could not be saved: {e:#}"
                 )),
             ),
         };
-        let mut stream = Stream::new(diff, &placed, store.comments());
-        let mut tree = FileTree::new(&diff.files, &counts);
+        let mut stream = Stream::new(display, &placed, store.comments());
+        let mut tree = FileTree::new(&display.files, &counts);
         tree.apply_collapsed(&view.collapsed);
         if let Some(query) = &view.query {
-            stream.set_search(query, &diff.files);
+            stream.set_search(query, &display.files);
         }
         if let Some(anchor) = &view.anchor {
-            stream.restore(anchor, &diff.files);
+            stream.restore(anchor, &display.files);
         }
         (stream, tree, warning)
+    }
+
+    fn canonical_diff(&self) -> DiffResult {
+        self.canonical_diff_for(&self.diff)
+    }
+
+    fn canonical_diff_for(&self, display: &DiffResult) -> DiffResult {
+        let files = display
+            .files
+            .iter()
+            .map(|file| {
+                self.full_context
+                    .get(&file.path)
+                    .map_or_else(|| file.clone(), |state| state.base.clone())
+            })
+            .collect();
+        DiffResult::from_files(files)
+    }
+
+    fn full_context_status(&self) -> Option<(bool, bool)> {
+        let fi = self.stream.current_file()?;
+        let file = self.diff.files.get(fi)?;
+        if let Some(state) = self.full_context.get(&file.path) {
+            Some((true, state.loading))
+        } else if full_context_eligible(file) {
+            Some((false, false))
+        } else {
+            None
+        }
+    }
+
+    fn toggle_full_context(&mut self, store: &mut CommentStore) -> FullContextToggle {
+        let Some(fi) = self.stream.current_file() else {
+            return FullContextToggle::Unavailable;
+        };
+        let path = self.diff.files[fi].path.clone();
+        if let Some(state) = self.full_context.remove(&path) {
+            let view = self.capture_view();
+            if let Some(display) = self.diff.files.iter_mut().find(|file| file.path == path) {
+                *display = state.base;
+            }
+            let warning = self.rebuild_with_view(store, &view);
+            return FullContextToggle::Collapsed(warning);
+        }
+        let file = &self.diff.files[fi];
+        if !full_context_eligible(file) {
+            return FullContextToggle::Unavailable;
+        }
+        self.full_context.insert(
+            path.clone(),
+            FullContextState {
+                base: file.clone(),
+                loading: true,
+            },
+        );
+        FullContextToggle::Load {
+            path,
+            old_path: file.old_path.clone(),
+        }
+    }
+
+    fn rebuild_with_view(
+        &mut self,
+        store: &mut CommentStore,
+        view: &ReviewViewState,
+    ) -> Option<String> {
+        let canonical = self.canonical_diff();
+        let (stream, tree, warning) = Self::build_views(&canonical, &self.diff, store, view);
+        self.install_views(stream, tree);
+        warning
+    }
+
+    fn install_full_context(
+        &mut self,
+        path: &str,
+        mut expanded: FileDiff,
+        store: &mut CommentStore,
+    ) -> Result<FullContextInstall, String> {
+        let Some(state) = self.full_context.get_mut(path) else {
+            return Ok(FullContextInstall::Ignored); // collapsed while in flight
+        };
+        if !diff::same_changes(&state.base, &expanded) {
+            self.full_context.remove(path);
+            return Err(format!(
+                "{path} changed since this review snapshot; press r to reload"
+            ));
+        }
+        diff::mark_expanded_context(&state.base, &mut expanded);
+        state.loading = false;
+        let view = self.capture_view();
+        let Some(file) = self.diff.files.iter_mut().find(|file| file.path == path) else {
+            self.full_context.remove(path);
+            return Ok(FullContextInstall::Ignored);
+        };
+        *file = expanded;
+        Ok(FullContextInstall::Installed(
+            self.rebuild_with_view(store, &view),
+        ))
+    }
+
+    fn cancel_full_context_load(&mut self, path: &str) {
+        if self
+            .full_context
+            .get(path)
+            .is_some_and(|state| state.loading)
+        {
+            self.full_context.remove(path);
+        }
     }
 
     fn install_views(&mut self, stream: Stream, tree: FileTree) {
@@ -530,7 +698,18 @@ impl App {
                 match &mut self.screen {
                     // Same scope already open: this is a reload.
                     Screen::Review(review) if review.scope == scope => {
-                        self.comment_warning = review.replace_diff(diff, &mut self.store);
+                        let (warning, full_context_paths) =
+                            review.replace_diff(diff, &mut self.store);
+                        self.comment_warning = warning;
+                        for (path, old_path) in full_context_paths {
+                            let _ = self.loader.send(LoadRequest::File {
+                                seq: self.seq,
+                                scope: scope.clone(),
+                                path,
+                                old_path,
+                                kind: FileLoadKind::FullContext,
+                            });
+                        }
                         self.reloaded_at = Some(Instant::now());
                     }
                     // Otherwise it's a scope being opened.
@@ -549,6 +728,7 @@ impl App {
                 seq,
                 scope,
                 path,
+                kind,
                 files,
             } => {
                 if seq != self.seq || !matches!(&self.screen, Screen::Review(r) if r.scope == scope)
@@ -558,13 +738,39 @@ impl App {
                 let loaded = match files {
                     Ok(f) => f,
                     Err(e) => {
+                        if kind == FileLoadKind::FullContext
+                            && let Screen::Review(review) = &mut self.screen
+                        {
+                            review.cancel_full_context_load(&path);
+                        }
                         self.error = Some(format!("{e:#}"));
                         return;
                     }
                 };
                 if let Screen::Review(review) = &mut self.screen {
-                    if let Some(pos) = review.diff.files.iter().position(|f| f.path == path) {
-                        self.comment_warning = review.expand_file(pos, loaded, &mut self.store);
+                    match kind {
+                        FileLoadKind::Stub { .. } => {
+                            if let Some(pos) = review.diff.files.iter().position(|f| f.path == path)
+                            {
+                                self.comment_warning =
+                                    review.expand_file(pos, loaded, &mut self.store);
+                            }
+                        }
+                        FileLoadKind::FullContext => {
+                            let Some(expanded) = loaded.into_iter().next() else {
+                                review.cancel_full_context_load(&path);
+                                self.error = Some(format!("no diff returned for {path}"));
+                                return;
+                            };
+                            match review.install_full_context(&path, expanded, &mut self.store) {
+                                Ok(FullContextInstall::Installed(warning)) => {
+                                    self.comment_warning = warning;
+                                    self.notice = Some(format!("showing full diff for {path}"));
+                                }
+                                Ok(FullContextInstall::Ignored) => {}
+                                Err(message) => self.error = Some(message),
+                            }
+                        }
                     }
                 }
             }
@@ -858,6 +1064,19 @@ impl App {
                     h(t, &[Down, Up], "scroll"),
                     h(t, &[NextFile, PrevFile], "file"),
                 ];
+                if let Some((expanded, loading)) = review.full_context_status() {
+                    hints.push(h(
+                        t,
+                        &[Activate],
+                        if loading {
+                            "cancel full diff"
+                        } else if expanded {
+                            "collapse full diff"
+                        } else {
+                            "show full diff"
+                        },
+                    ));
+                }
                 if review.stream.has_search() {
                     hints.push(h(t, &[NextMatch, PrevMatch], "match"));
                     hints.push(raw("Esc", "clear search"));
@@ -1362,6 +1581,8 @@ impl App {
                         target: None,
                         label: format!("edit #{} on {}", c.id, c.path),
                     }));
+                } else if review.stream.expanded_context_at_cursor(&review.diff.files) {
+                    self.error = Some("comments require a line in the original diff".into());
                 } else if let Some(t) = review.stream.line_target(&review.diff.files) {
                     self.overlay = Some(Overlay::Comment(CommentDraft {
                         editor: TextEditor::new(String::new()),
@@ -1537,8 +1758,27 @@ impl App {
                         seq: self.seq,
                         scope: review.scope.clone(),
                         path,
-                        untracked_dir,
+                        old_path: None,
+                        kind: FileLoadKind::Stub { untracked_dir },
                     });
+                } else {
+                    match review.toggle_full_context(&mut self.store) {
+                        FullContextToggle::Load { path, old_path } => {
+                            self.notice = Some(format!("loading full diff for {path}…"));
+                            let _ = self.loader.send(LoadRequest::File {
+                                seq: self.seq,
+                                scope: review.scope.clone(),
+                                path,
+                                old_path,
+                                kind: FileLoadKind::FullContext,
+                            });
+                        }
+                        FullContextToggle::Collapsed(warning) => {
+                            self.comment_warning = warning;
+                            self.notice = Some("collapsed full diff context".into());
+                        }
+                        FullContextToggle::Unavailable => {}
+                    }
                 }
             }
             _ => {}
@@ -1673,6 +1913,14 @@ fn comment_counts(diff: &DiffResult, store: &CommentStore) -> Vec<usize> {
         .iter()
         .map(|f| store.count_for_path(&f.path))
         .collect()
+}
+
+fn full_context_eligible(file: &FileDiff) -> bool {
+    matches!(file.status, FileStatus::Modified | FileStatus::Renamed)
+        && !file.binary
+        && !file.large
+        && !file.untracked_dir
+        && !file.hunks.is_empty()
 }
 
 fn target_label(t: &CommentTarget) -> String {
@@ -1967,6 +2215,7 @@ mod layout_tests {
             large: false,
             byte_size: 0,
             untracked_dir: false,
+            full_context: false,
             hunks: vec![Hunk {
                 header: "@@ @@".into(),
                 lines: vec![DiffLine {
@@ -1974,6 +2223,7 @@ mod layout_tests {
                     old_lineno: None,
                     new_lineno: Some(14),
                     content: "line 11".into(),
+                    expanded_context: false,
                 }],
             }],
             additions: 1,
@@ -2013,6 +2263,7 @@ mod layout_tests {
             large: false,
             byte_size: 0,
             untracked_dir: false,
+            full_context: false,
             hunks: vec![Hunk {
                 header: "@@ @@".into(),
                 lines: [11, 12]
@@ -2022,6 +2273,7 @@ mod layout_tests {
                         old_lineno: None,
                         new_lineno: Some(line),
                         content: format!("line {line}"),
+                        expanded_context: false,
                     })
                     .collect(),
             }],

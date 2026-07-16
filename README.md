@@ -60,9 +60,11 @@ fork point) · `-b <base>` (vs merge-base) · `gittre <rev>` · `gittre a..b` ·
 The keys are helix-friendly. `j`/`k` move the cursor (`gg`/`ge` top/bottom,
 `⌃d`/`⌃u` half page), `]`/`[` next/prev file, `n`/`p` next/prev hunk,
 `/` search (`n`/`N` between matches), `v` or `x` select + `y` copy code /
-`Y` copy patch, `o` view the full file, `E` open it in `$EDITOR` at the
-current line, and `r` reload the diff. Mouse works: wheel scrolls, click jumps.
-Long lines wrap beneath the same gutter with a continuation marker. `?` shows
+`Y` copy patch, `Enter` expand/collapse the current modified file inline with
+its diff still visible, `o` view the plain full file, `E` open it in `$EDITOR`
+at the current line, and `r` reload the diff. Inline expansion loads in the
+background and survives reloads. Mouse works: wheel scrolls, click jumps. Long
+lines wrap beneath the same gutter with a continuation marker. `?` shows
 everything else.
 
 ### Commenting
@@ -85,6 +87,9 @@ gittre export -o rev.md  # or to a file
 ```
 
 Comments live in `.git/gittre/comments.json` — never in your working tree.
+Extra unchanged lines revealed by inline full-file expansion are available for
+reading, searching, and copying, but comments stay anchored to the original
+review diff.
 
 ## Notes
 

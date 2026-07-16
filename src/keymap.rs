@@ -469,6 +469,10 @@ pub static HELP: &[(&str, &[HelpItem])] = &[
         "Views & scope",
         &[
             HelpItem::Act(
+                &[Activate],
+                "show / collapse the full file inline (or load a stub)",
+            ),
+            HelpItem::Act(
                 &[FileView],
                 "view the full file (read-only, at the current line)",
             ),
