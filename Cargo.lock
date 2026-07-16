@@ -719,6 +719,7 @@ version = "0.1.10"
 dependencies = [
  "anyhow",
  "arboard",
+ "base64",
  "clap",
  "git2",
  "ratatui",

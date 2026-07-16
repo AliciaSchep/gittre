@@ -3,8 +3,10 @@
 A terminal UI for **reviewing** git changes: read diffs, fast. It deliberately
 does *not* commit, stage, merge, stash, or push. Inspiration:
 [gitui](https://github.com/gitui-org/gitui) (always-visible command hints,
-keyboard-first) and [hunk](https://github.com/modem-dev/hunk) (review-first
-continuous diff stream and file sidebar).
+keyboard-first), [hunk](https://github.com/modem-dev/hunk) (review-first
+continuous diff stream and file sidebar), and
+[tuicr](https://github.com/agavra/tuicr) (terminal-native commenting and
+structured review feedback).
 
 Commenting + markdown export is the product differentiator: comments persist
 outside the worktree, follow code as it moves, render inline, and can be
@@ -228,10 +230,13 @@ expand" row.
   4. Polish: `}`/`{` comment navigation ✅; resolve state deferred.
 - **M6 — review UX polish.** ✅ Anchored, wrapping, scrollable comment editor
   with caret navigation and paste support; saved inline comments reflow with
-  the diff pane; content-aware file tree that grows on wide terminals; exact
-  markdown preview with scrolling, clipboard copy, and an explicit write step.
-  The tree can be resized from the keyboard with `</>` and reset to automatic
-  sizing with `=`. Mouse dragging is permanently out of scope.
+  the diff pane; long diff lines wrap beneath a stable gutter with continuation
+  markers while preserving logical-line actions; content-aware file tree that
+  grows on wide terminals; exact markdown preview with scrolling, clipboard
+  copy, and an explicit write step. Clipboard writes prefer the desktop
+  clipboard locally and use OSC 52 for SSH/fallback operation, with tmux
+  passthrough. The tree can be resized from the keyboard with `</>` and reset
+  to automatic sizing with `=`. Mouse dragging is permanently out of scope.
 
 Each milestone is shippable; M1–M3 is already a useful daily tool.
 

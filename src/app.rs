@@ -10,6 +10,7 @@ use ratatui::crossterm::event::{
 use ratatui::prelude::*;
 use ratatui::widgets::Paragraph;
 
+use crate::clipboard;
 use crate::comments::{Comment, CommentStore, export_markdown};
 use crate::event::{AppEvent, LoadRequest, ScopeCounts, spawn_loader};
 use crate::git::diff::DiffResult;
@@ -19,7 +20,7 @@ use crate::keymap::{self, Action, KeyPress, Lookup};
 use crate::ui::fileview::FileView;
 use crate::ui::highlight::Highlighter;
 use crate::ui::picker::{BasePicker, LogPicker, ScopeAction, ScopeItem, ScopePicker, count_label};
-use crate::ui::review::{CommentTarget, Stream};
+use crate::ui::review::{CommentTarget, Stream, StreamAnchor};
 use crate::ui::tree::FileTree;
 use crate::ui::{bar, editor::TextEditor, export::ExportPreview, popups};
 
@@ -50,7 +51,7 @@ struct ReviewState {
 
 #[derive(Default)]
 struct ReviewViewState {
-    anchor: Option<(String, usize, usize)>,
+    anchor: Option<StreamAnchor>,
     collapsed: std::collections::HashSet<String>,
     query: Option<String>,
 }
@@ -1073,9 +1074,7 @@ impl App {
                         Action::WriteFile => write = true,
                         Action::CopyMarkdown => {
                             let markdown = preview.markdown().to_string();
-                            match arboard::Clipboard::new()
-                                .and_then(|mut clipboard| clipboard.set_text(markdown))
-                            {
+                            match clipboard::copy(&markdown) {
                                 Ok(()) => self.notice = Some("copied export markdown".into()),
                                 Err(e) => self.error = Some(format!("clipboard: {e}")),
                             }
@@ -1594,7 +1593,7 @@ impl App {
             return;
         };
         let lines = text.lines().count();
-        match arboard::Clipboard::new().and_then(|mut c| c.set_text(text)) {
+        match clipboard::copy(&text) {
             Ok(()) => {
                 let style = if patch_style { "as patch" } else { "as code" };
                 self.notice = Some(format!(

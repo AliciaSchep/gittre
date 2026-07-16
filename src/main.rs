@@ -1,4 +1,5 @@
 mod app;
+mod clipboard;
 mod comments;
 mod event;
 mod git;

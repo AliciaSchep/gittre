@@ -9,6 +9,9 @@ use crate::comments::{Anchor, Comment, Placed};
 use crate::git::diff::{DiffResult, FileDiff, FileStatus};
 use crate::ui::highlight::Highlighter;
 
+/// Old line, new line, spaces, and the diff/continuation marker.
+const DIFF_GUTTER_WIDTH: usize = 13;
+
 /// One renderable row of the concatenated diff stream.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Row {
@@ -18,7 +21,9 @@ enum Row {
     /// Oversized file whose diff wasn't loaded; Enter expands it.
     LargeStub(usize),
     HunkHeader(usize, usize),
-    Line(usize, usize, usize),
+    /// A wrapped segment of one diff line:
+    /// (file, hunk, logical line, start byte, end byte).
+    Line(usize, usize, usize, usize, usize),
     /// Comment block header; the index is into the comment store slice.
     CommentHeader(usize),
     /// One preserved-snippet line of an outdated comment.
@@ -28,10 +33,21 @@ enum Row {
     CommentBody(usize, usize, usize, usize),
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct RowOrigin {
     template: usize,
-    body_offset: usize,
+    content_offset: usize,
+}
+
+/// A width-independent reading position. The template row identifies a
+/// logical row; `content_offset` keeps the same wrapped segment after resize
+/// or reload.
+#[derive(Clone, Debug)]
+pub struct StreamAnchor {
+    path: String,
+    template_offset: usize,
+    content_offset: usize,
+    screen_offset: usize,
 }
 
 struct SearchState {
@@ -58,7 +74,7 @@ pub struct Stream {
     template_rows: Vec<Row>,
     rows: Vec<Row>,
     row_origins: Vec<RowOrigin>,
-    comment_wrap_width: usize,
+    wrap_width: usize,
     /// Row index of each file's header, in file order.
     file_starts: Vec<usize>,
     /// Row index of each hunk header, in stream order.
@@ -73,6 +89,9 @@ pub struct Stream {
     /// Height of the last rendered viewport, for paging and clamping.
     viewport: Cell<usize>,
     search: Option<SearchState>,
+    /// Restore is requested before the first width-dependent reflow. Hold the
+    /// exact logical origin until render supplies the pane width.
+    pending_anchor: Option<(RowOrigin, usize)>,
     /// Inner rect from the last render, for mouse hit-testing.
     last_inner: Cell<Rect>,
     /// Cached syntax spans per (file, hunk, line); None caches a miss.
@@ -137,7 +156,8 @@ impl Stream {
                 hunk_starts.push(rows.len());
                 rows.push(Row::HunkHeader(fi, hi));
                 for li in 0..hunk.lines.len() {
-                    rows.push(Row::Line(fi, hi, li));
+                    let len = hunk.lines[li].content.len();
+                    rows.push(Row::Line(fi, hi, li, 0, len));
                     if let Some(cs) = at_line.get(&(fi, hi, li)) {
                         for &ci in cs {
                             push_comment(&mut rows, &mut comment_starts, ci, false);
@@ -152,14 +172,14 @@ impl Stream {
         let row_origins = (0..rows.len())
             .map(|template| RowOrigin {
                 template,
-                body_offset: 0,
+                content_offset: 0,
             })
             .collect();
         Stream {
             template_rows,
             rows,
             row_origins,
-            comment_wrap_width: 0,
+            wrap_width: 0,
             file_starts,
             hunk_starts,
             comment_starts,
@@ -168,6 +188,7 @@ impl Stream {
             selection_anchor: None,
             viewport: Cell::new(24),
             search: None,
+            pending_anchor: None,
             last_inner: Cell::new(Rect::default()),
             syntax_cache: RefCell::new(HashMap::new()),
         }
@@ -278,8 +299,13 @@ impl Stream {
         let mut new_nums: Vec<u32> = Vec::new();
         let mut old_nums: Vec<u32> = Vec::new();
         let mut snippet = Vec::new();
+        let mut previous_line = None;
         for row in &self.rows[lo..=hi.min(self.rows.len() - 1)] {
-            if let Row::Line(fi, hi_, li) = *row {
+            if let Row::Line(fi, hi_, li, _, _) = *row {
+                if previous_line == Some((fi, hi_, li)) {
+                    continue;
+                }
+                previous_line = Some((fi, hi_, li));
                 if *target_location.get_or_insert((fi, hi_)) != (fi, hi_) {
                     return Err("comments must stay within one file and hunk");
                 }
@@ -315,7 +341,7 @@ impl Stream {
     /// Target for a bare `c`: the first diff line at/below the cursor.
     pub fn line_target(&self, files: &[FileDiff]) -> Option<CommentTarget> {
         self.rows.iter().skip(self.cursor).find_map(|row| {
-            let Row::Line(fi, hi, li) = *row else {
+            let Row::Line(fi, hi, li, _, _) = *row else {
                 return None;
             };
             let line = &files[fi].hunks[hi].lines[li];
@@ -360,9 +386,14 @@ impl Stream {
     pub fn selected_text(&self, files: &[FileDiff], patch_style: bool) -> Option<String> {
         let (lo, hi) = self.selection_range()?;
         let mut out = String::new();
+        let mut previous_line = None;
         for row in &self.rows[lo..=hi.min(self.rows.len() - 1)] {
             match *row {
-                Row::Line(fi, hi_, li) => {
+                Row::Line(fi, hi_, li, _, _) => {
+                    if previous_line == Some((fi, hi_, li)) {
+                        continue;
+                    }
+                    previous_line = Some((fi, hi_, li));
                     let line = &files[fi].hunks[hi_].lines[li];
                     if patch_style {
                         out.push(line.origin);
@@ -399,9 +430,12 @@ impl Stream {
             .iter()
             .enumerate()
             .filter_map(|(i, row)| {
-                let Row::Line(fi, hi, li) = *row else {
+                let Row::Line(fi, hi, li, start, _) = *row else {
                     return None;
                 };
+                if start != 0 {
+                    return None;
+                }
                 let content = &files[fi].hunks[hi].lines[li].content;
                 let hit = if case_sensitive {
                     content.contains(&needle)
@@ -510,33 +544,50 @@ impl Stream {
         }
     }
 
-    /// Where the reader is: (file path, cursor rows below its header, cursor
-    /// rows below the viewport top) — stable across reloads even when other
-    /// files grow or shrink.
-    pub fn anchor(&self, files: &[FileDiff]) -> Option<(String, usize, usize)> {
+    fn template_file_start(&self, file: usize) -> Option<usize> {
+        self.template_rows
+            .iter()
+            .position(|row| matches!(row, Row::FileHeader(fi) if *fi == file))
+    }
+
+    /// Width-independent reader position, stable across reloads even when
+    /// earlier files grow or the diff pane wraps at a different width.
+    pub fn anchor(&self, files: &[FileDiff]) -> Option<StreamAnchor> {
         let fi = self.current_file()?;
-        let rel = self.cursor - self.file_starts[fi];
-        let screen_offset = self.cursor.saturating_sub(self.scroll);
-        Some((files[fi].path.clone(), rel, screen_offset))
+        let origin = self.row_origins.get(self.cursor).copied()?;
+        let template_start = self.template_file_start(fi)?;
+        Some(StreamAnchor {
+            path: files[fi].path.clone(),
+            template_offset: origin.template.saturating_sub(template_start),
+            content_offset: origin.content_offset,
+            screen_offset: self.cursor.saturating_sub(self.scroll),
+        })
     }
 
     /// Re-apply an anchor after the diff was rebuilt. Falls back to clamping
     /// when the anchored file disappeared from the new diff.
-    pub fn restore(&mut self, anchor: &(String, usize, usize), files: &[FileDiff]) {
-        let (path, rel, screen_offset) = anchor;
-        if let Some(fi) = files.iter().position(|f| &f.path == path) {
-            let start = self.file_starts[fi];
+    pub fn restore(&mut self, anchor: &StreamAnchor, files: &[FileDiff]) {
+        self.pending_anchor = None;
+        if let Some(fi) = files.iter().position(|f| f.path == anchor.path)
+            && let Some(start) = self.template_file_start(fi)
+        {
             let end = self
-                .file_starts
-                .get(fi + 1)
-                .copied()
-                .unwrap_or(self.rows.len());
-            self.cursor = (start + rel).min(end.saturating_sub(1));
+                .template_file_start(fi + 1)
+                .unwrap_or(self.template_rows.len());
+            let template = (start + anchor.template_offset).min(end.saturating_sub(1));
+            let origin = RowOrigin {
+                template,
+                content_offset: anchor.content_offset,
+            };
+            if let Some(row) = locate_origin(&self.row_origins, origin) {
+                self.cursor = row;
+            }
+            self.pending_anchor = Some((origin, anchor.screen_offset));
         }
         self.cursor = self.clamp_row(self.cursor as isize);
         self.scroll = self
             .cursor
-            .saturating_sub(*screen_offset)
+            .saturating_sub(anchor.screen_offset)
             .min(self.scroll_limit());
         self.ensure_cursor_visible();
     }
@@ -554,7 +605,7 @@ impl Stream {
             .unwrap_or(self.rows.len());
         let cursor = self.cursor.clamp(start, end.saturating_sub(1));
         let line_number = |row: &Row| match *row {
-            Row::Line(row_fi, hi, li) if row_fi == fi => {
+            Row::Line(row_fi, hi, li, _, _) if row_fi == fi => {
                 let line = &files[fi].hunks[hi].lines[li];
                 line.new_lineno.or(line.old_lineno)
             }
@@ -616,14 +667,20 @@ impl Stream {
         }
     }
 
-    fn reflow_comments(&mut self, width: u16, comments: &[Comment]) {
+    fn reflow_rows(&mut self, width: u16, files: &[FileDiff], comments: &[Comment]) {
         let width = width.max(1) as usize;
-        if width == self.comment_wrap_width {
+        if width == self.wrap_width && self.pending_anchor.is_none() {
             return;
         }
 
-        let screen_offset = self.cursor.saturating_sub(self.scroll);
-        let cursor_origin = self.row_origins.get(self.cursor).copied();
+        let (pending_origin, pending_screen_offset) = self
+            .pending_anchor
+            .take()
+            .map(|(origin, offset)| (Some(origin), Some(offset)))
+            .unwrap_or((None, None));
+        let screen_offset =
+            pending_screen_offset.unwrap_or_else(|| self.cursor.saturating_sub(self.scroll));
+        let cursor_origin = pending_origin.or_else(|| self.row_origins.get(self.cursor).copied());
         let selection_origin = self
             .selection_anchor
             .and_then(|row| self.row_origins.get(row).copied());
@@ -637,15 +694,27 @@ impl Stream {
 
         let mut rows = Vec::new();
         let mut origins = Vec::new();
+        let comment_width = width.saturating_sub(2).max(1);
+        let diff_width = width.saturating_sub(DIFF_GUTTER_WIDTH).max(1);
         for (template, row) in self.template_rows.iter().copied().enumerate() {
             match row {
                 Row::CommentBody(ci, bi, _, _) => {
                     let body = comments[ci].body.lines().nth(bi).unwrap_or("");
-                    for (start, end) in wrap_ranges(body, width) {
+                    for (start, end) in wrap_ranges(body, comment_width) {
                         rows.push(Row::CommentBody(ci, bi, start, end));
                         origins.push(RowOrigin {
                             template,
-                            body_offset: start,
+                            content_offset: start,
+                        });
+                    }
+                }
+                Row::Line(fi, hi, li, _, _) => {
+                    let content = &files[fi].hunks[hi].lines[li].content;
+                    for (start, end) in wrap_ranges(content, diff_width) {
+                        rows.push(Row::Line(fi, hi, li, start, end));
+                        origins.push(RowOrigin {
+                            template,
+                            content_offset: start,
                         });
                     }
                 }
@@ -653,32 +722,24 @@ impl Stream {
                     rows.push(row);
                     origins.push(RowOrigin {
                         template,
-                        body_offset: 0,
+                        content_offset: 0,
                     });
                 }
             }
         }
 
-        let locate = |origin: RowOrigin| {
-            origins
-                .iter()
-                .enumerate()
-                .filter(|(_, candidate)| {
-                    candidate.template == origin.template
-                        && candidate.body_offset <= origin.body_offset
-                })
-                .map(|(row, _)| row)
-                .next_back()
-        };
-
-        let cursor_row = cursor_origin.and_then(locate);
-        let selection_row = selection_origin.and_then(locate);
-        let search_rows = search_origins
-            .map(|origins| origins.into_iter().filter_map(locate).collect::<Vec<_>>());
+        let cursor_row = cursor_origin.and_then(|origin| locate_origin(&origins, origin));
+        let selection_row = selection_origin.and_then(|origin| locate_origin(&origins, origin));
+        let search_rows = search_origins.map(|search| {
+            search
+                .into_iter()
+                .filter_map(|origin| locate_origin(&origins, origin))
+                .collect::<Vec<_>>()
+        });
 
         self.rows = rows;
         self.row_origins = origins;
-        self.comment_wrap_width = width;
+        self.wrap_width = width;
         if let Some(row) = cursor_row {
             self.cursor = row;
         }
@@ -716,7 +777,6 @@ impl Stream {
         focused: bool,
         hl: &Highlighter,
     ) {
-        self.reflow_comments(area.width.saturating_sub(2), comments);
         let border_style = if focused {
             Style::new().cyan()
         } else {
@@ -736,6 +796,7 @@ impl Stream {
             .title(Line::from(title.bold()));
         let inner = block.inner(area);
         frame.render_widget(block, area);
+        self.reflow_rows(inner.width, files, comments);
 
         self.viewport.set(inner.height as usize);
         self.last_inner.set(inner);
@@ -926,38 +987,77 @@ impl Stream {
                 Line::from(vec!["▐ ".cyan(), Span::raw(text.to_string())])
             }
             Row::HunkHeader(fi, hi) => Line::from(files[fi].hunks[hi].header.clone().cyan()),
-            Row::Line(fi, hi, li) => {
+            Row::Line(fi, hi, li, start, end) => {
                 let line = &files[fi].hunks[hi].lines[li];
-                let old = line
-                    .old_lineno
-                    .map(|n| format!("{n:>5}"))
-                    .unwrap_or_else(|| " ".repeat(5));
-                let new = line
-                    .new_lineno
-                    .map(|n| format!("{n:>5}"))
-                    .unwrap_or_else(|| " ".repeat(5));
-                let gutter = format!("{old} {new} ");
                 let base_style = match line.origin {
                     '+' => Style::new().green(),
                     '-' => Style::new().red(),
                     _ => Style::new(),
                 };
-                let mut spans = vec![gutter.dark_gray()];
-                spans.push(Span::styled(line.origin.to_string(), base_style));
+                let mut spans = if start == 0 {
+                    let old = line
+                        .old_lineno
+                        .map(|n| format!("{n:>5}"))
+                        .unwrap_or_else(|| " ".repeat(5));
+                    let new = line
+                        .new_lineno
+                        .map(|n| format!("{n:>5}"))
+                        .unwrap_or_else(|| " ".repeat(5));
+                    vec![
+                        format!("{old} {new} ").dark_gray(),
+                        Span::styled(line.origin.to_string(), base_style),
+                    ]
+                } else {
+                    vec![" ".repeat(DIFF_GUTTER_WIDTH - 1).into(), "▏".dark_gray()]
+                };
                 // Search hits keep the plain rendering so the yellow overlay
                 // stays visible; everything else gets syntax colors.
                 let searched = self.search.is_some() && self.line_matches_search(&line.content);
                 let syntax = (!searched)
                     .then(|| self.syntax_spans(hl, (fi, hi, li), &files[fi].path, line))
                     .flatten();
-                match syntax {
-                    Some(sp) => spans.extend(sp),
-                    None => spans.extend(self.content_spans(&line.content, base_style)),
-                }
+                let content = match syntax {
+                    Some(spans) => spans,
+                    None => self.content_spans(&line.content, base_style),
+                };
+                spans.extend(slice_spans(&content, start, end));
                 Line::from(spans)
             }
         }
     }
+}
+
+fn locate_origin(origins: &[RowOrigin], origin: RowOrigin) -> Option<usize> {
+    origins
+        .iter()
+        .enumerate()
+        .filter(|(_, candidate)| {
+            candidate.template == origin.template
+                && candidate.content_offset <= origin.content_offset
+        })
+        .map(|(row, _)| row)
+        .next_back()
+}
+
+fn slice_spans(spans: &[Span<'static>], start: usize, end: usize) -> Vec<Span<'static>> {
+    let mut sliced = Vec::new();
+    let mut offset = 0;
+    for span in spans {
+        let span_end = offset + span.content.len();
+        let lo = start.max(offset);
+        let hi = end.min(span_end);
+        if lo < hi {
+            sliced.push(Span::styled(
+                span.content[lo - offset..hi - offset].to_string(),
+                span.style,
+            ));
+        }
+        offset = span_end;
+        if offset >= end {
+            break;
+        }
+    }
+    sliced
 }
 
 fn wrap_ranges(text: &str, width: usize) -> Vec<(usize, usize)> {
@@ -1050,7 +1150,7 @@ mod tests {
         stream.jump_to_file(1);
         stream.scroll_by(2); // two rows into b.txt
         let anchor = stream.anchor(&before.files).unwrap();
-        assert_eq!(anchor.0, "b.txt");
+        assert_eq!(anchor.path, "b.txt");
 
         // a.txt grows by 10 lines; b.txt's rows all shift down.
         let after = diff(&[("a.txt", 13), ("b.txt", 5)]);
@@ -1192,14 +1292,91 @@ mod tests {
         }];
         let mut stream = Stream::new(&diff, &placed, &comments);
 
-        stream.reflow_comments(10, &comments);
-        assert_eq!(stream.comment_starts, [3]);
-        assert_eq!(stream.rows.len(), 8, "body expands to four visual rows");
-        stream.cursor = 5;
+        stream.reflow_rows(12, &diff.files, &comments);
+        assert_eq!(
+            stream
+                .rows
+                .iter()
+                .filter(|row| matches!(row, Row::CommentBody(..)))
+                .count(),
+            4,
+            "body expands to four visual rows"
+        );
+        stream.cursor = stream.comment_starts[0] + 2;
         assert_eq!(stream.comment_at_cursor(), Some(0));
 
-        stream.reflow_comments(20, &comments);
+        stream.reflow_rows(22, &diff.files, &comments);
         assert_eq!(stream.comment_at_cursor(), Some(0));
-        assert_eq!(stream.rows.len(), 6, "body reflows to two visual rows");
+        assert_eq!(
+            stream
+                .rows
+                .iter()
+                .filter(|row| matches!(row, Row::CommentBody(..)))
+                .count(),
+            2,
+            "body reflows to two visual rows"
+        );
+    }
+
+    #[test]
+    fn diff_lines_wrap_without_duplicating_logical_actions() {
+        let mut diff = diff(&[("a.txt", 1)]);
+        diff.files[0].hunks[0].lines[0].content = "abcdefghijklmnopqrst".into();
+        let mut stream = Stream::new(&diff, &[], &[]);
+
+        stream.reflow_rows(18, &diff.files, &[]); // five content cells per row
+        let line_rows: Vec<usize> = stream
+            .rows
+            .iter()
+            .enumerate()
+            .filter_map(|(row, item)| matches!(item, Row::Line(..)).then_some(row))
+            .collect();
+        assert_eq!(line_rows.len(), 4);
+        assert!(matches!(
+            stream.rows[line_rows[1]],
+            Row::Line(_, _, _, 5, 10)
+        ));
+
+        stream.selection_anchor = Some(line_rows[0]);
+        stream.cursor = *line_rows.last().unwrap();
+        assert_eq!(
+            stream.selected_text(&diff.files, true).as_deref(),
+            Some("+abcdefghijklmnopqrst\n")
+        );
+        assert_eq!(
+            stream
+                .selection_target(&diff.files)
+                .unwrap()
+                .unwrap()
+                .snippet,
+            ["+abcdefghijklmnopqrst"]
+        );
+        assert_eq!(stream.set_search("klm", &diff.files), 1);
+    }
+
+    #[test]
+    fn wrapped_cursor_anchor_survives_reload_and_width_change() {
+        let mut before = diff(&[("a.txt", 1)]);
+        before.files[0].hunks[0].lines[0].content = "abcdefghijklmnopqrst".into();
+        let mut stream = Stream::new(&before, &[], &[]);
+        stream.reflow_rows(18, &before.files, &[]);
+        stream.cursor = stream
+            .rows
+            .iter()
+            .position(|row| matches!(row, Row::Line(_, _, _, 10, 15)))
+            .unwrap();
+        let anchor = stream.anchor(&before.files).unwrap();
+
+        let mut after = diff(&[("a.txt", 1)]);
+        after.files[0].hunks[0].lines[0].content = "abcdefghijklmnopqrstuv".into();
+        let mut restored = Stream::new(&after, &[], &[]);
+        restored.restore(&anchor, &after.files);
+        restored.reflow_rows(20, &after.files, &[]); // seven content cells per row
+
+        assert!(matches!(
+            restored.rows[restored.cursor],
+            Row::Line(_, _, _, 7, 14)
+        ));
+        assert_eq!(restored.current_position(&after.files), Some((0, Some(1))));
     }
 }

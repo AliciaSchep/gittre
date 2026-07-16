@@ -5,8 +5,9 @@ export them to markdown. It deliberately does *not* commit, stage, merge, or
 push — it's a review tool, nothing else.
 
 Inspired by [gitui](https://github.com/gitui-org/gitui) (the always-visible
-command bar) and [hunk](https://github.com/modem-dev/hunk) (the continuous
-multi-file diff stream).
+command bar), [hunk](https://github.com/modem-dev/hunk) (the continuous
+multi-file diff stream), and [tuicr](https://github.com/agavra/tuicr)
+(terminal-native commenting and structured review feedback).
 
 ## Install
 
@@ -61,7 +62,8 @@ The keys are helix-friendly. `j`/`k` move the cursor (`gg`/`ge` top/bottom,
 `/` search (`n`/`N` between matches), `v` or `x` select + `y` copy code /
 `Y` copy patch, `o` view the full file, `E` open it in `$EDITOR` at the
 current line, and `r` reload the diff. Mouse works: wheel scrolls, click jumps.
-`?` shows everything else.
+Long lines wrap beneath the same gutter with a continuation marker. `?` shows
+everything else.
 
 ### Commenting
 
@@ -88,6 +90,8 @@ Comments live in `.git/gittre/comments.json` — never in your working tree.
 
 - Syntax highlighting needs a truecolor terminal (`COLORTERM=truecolor`);
   otherwise plain diff colors are used.
+- Copy uses the desktop clipboard when available and falls back to OSC 52 in
+  remote terminals, including tmux passthrough.
 - Design decisions and roadmap live in [PLAN.md](PLAN.md).
 - `dev/tui_drive.py` drives the TUI headlessly for testing
   (`uv run --with pyte dev/tui_drive.py <scenario.json>`).
