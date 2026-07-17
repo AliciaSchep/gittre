@@ -34,6 +34,59 @@ enum Focus {
 const TREE_RESIZE_STEP: u16 = 4;
 const MIN_MANUAL_TREE_WIDTH: u16 = 16;
 const MIN_DIFF_WIDTH: u16 = 60;
+const COMPACT_HINT_WIDTH: u16 = 70;
+
+fn review_stream_hints(
+    width: u16,
+    search_active: bool,
+    full_context: Option<(bool, bool)>,
+    show_tree: bool,
+) -> Vec<(String, &'static str)> {
+    use Action::*;
+    let t = keymap::REVIEW;
+    let h = |actions: &[Action], desc| (keymap::keys_label(t, actions), desc);
+    let raw = |key: &str, desc| (key.to_string(), desc);
+
+    if search_active {
+        return vec![
+            h(&[Down, Up], "scroll"),
+            h(&[NextFile, PrevFile], "file"),
+            h(&[NextMatch, PrevMatch], "match"),
+            raw("Esc", "clear search"),
+            h(&[Search], "search"),
+            h(&[Comment], "comment"),
+            h(&[SwitchScope], "scope"),
+            raw("?", "help"),
+        ];
+    }
+
+    let mut hints = vec![h(&[Down, Up], "scroll"), h(&[NextFile, PrevFile], "file")];
+    if let Some((expanded, loading)) = full_context {
+        hints.push(h(
+            &[Activate],
+            if loading {
+                "cancel full diff"
+            } else if expanded {
+                "collapse full diff"
+            } else {
+                "show full diff"
+            },
+        ));
+    }
+    hints.push(h(&[Search], "search"));
+    hints.push(h(&[Reload], "reload"));
+    hints.push(h(&[Comment], "comment"));
+    if width >= COMPACT_HINT_WIDTH {
+        hints.push(h(&[FocusTree], "pick file"));
+        hints.push(h(
+            &[ToggleTree],
+            if show_tree { "hide tree" } else { "show tree" },
+        ));
+    }
+    hints.push(h(&[SwitchScope], "scope"));
+    hints.push(raw("?", "help"));
+    hints
+}
 
 struct ReviewState {
     scope: Scope,
@@ -829,7 +882,7 @@ impl App {
             Some(Overlay::ExportPath { path, .. }) => {
                 bar::render_input(frame, bar_area, "export to ", path, "write")
             }
-            _ => bar::render(frame, bar_area, &self.hints()),
+            _ => bar::render(frame, bar_area, &self.hints(bar_area.width)),
         }
 
         let (comment_bounds, comment_anchor) = match &self.screen {
@@ -917,7 +970,7 @@ impl App {
     }
 
     /// Key labels come from the binding tables; only descriptions live here.
-    fn hints(&self) -> Vec<(String, &'static str)> {
+    fn hints(&self, bar_width: u16) -> Vec<(String, &'static str)> {
         use Action::*;
         fn h(
             table: &[keymap::Binding],
@@ -1060,49 +1113,12 @@ impl App {
                         raw("?", "help"),
                     ];
                 }
-                let mut hints = vec![
-                    h(t, &[Down, Up], "scroll"),
-                    h(t, &[NextFile, PrevFile], "file"),
-                ];
-                if let Some((expanded, loading)) = review.full_context_status() {
-                    hints.push(h(
-                        t,
-                        &[Activate],
-                        if loading {
-                            "cancel full diff"
-                        } else if expanded {
-                            "collapse full diff"
-                        } else {
-                            "show full diff"
-                        },
-                    ));
-                }
-                if review.stream.has_search() {
-                    hints.push(h(t, &[NextMatch, PrevMatch], "match"));
-                    hints.push(raw("Esc", "clear search"));
-                } else {
-                    hints.push(h(t, &[NextHunk, PrevHunk], "hunk"));
-                }
-                hints.push(h(t, &[Search], "search"));
-                hints.push(h(t, &[Reload], "reload"));
-                hints.push(h(t, &[Comment], "comment"));
-                if review.stream.has_comments() {
-                    hints.push(h(t, &[NextComment, PrevComment], "comment nav"));
-                }
-                hints.push(h(t, &[FocusTree], "pick file"));
-                hints.push(h(
-                    t,
-                    &[ToggleTree],
-                    if review.show_tree {
-                        "hide tree"
-                    } else {
-                        "show tree"
-                    },
-                ));
-                hints.push(h(t, &[NarrowTree, WidenTree, AutoTreeWidth], "tree width"));
-                hints.push(h(t, &[SwitchScope], "scope"));
-                hints.push(raw("?", "help"));
-                hints
+                review_stream_hints(
+                    bar_width,
+                    review.stream.has_search(),
+                    review.full_context_status(),
+                    review.show_tree,
+                )
             }
         }
     }
@@ -2111,13 +2127,56 @@ fn sync_tree(review: &mut ReviewState) {
 mod layout_tests {
     use super::{
         ReviewState, SingleLineInput, TreeResizeResult, adaptive_tree_width, edit_single_line,
-        resize_notice, resized_tree_width,
+        resize_notice, resized_tree_width, review_stream_hints,
     };
     use crate::comments::CommentStore;
     use crate::git::diff::{DiffLine, DiffResult, FileDiff, FileStatus, Hunk};
     use crate::git::scope::Scope;
     use git2::Repository;
     use ratatui::crossterm::event::KeyCode;
+
+    #[test]
+    fn normal_review_hints_keep_accelerators_in_help() {
+        let hints = review_stream_hints(120, false, Some((false, false)), true);
+        let descriptions: Vec<_> = hints.iter().map(|(_, description)| *description).collect();
+
+        assert!(descriptions.contains(&"show full diff"));
+        assert!(descriptions.contains(&"pick file"));
+        assert!(descriptions.contains(&"hide tree"));
+        assert!(descriptions.contains(&"scope"));
+        assert!(descriptions.contains(&"help"));
+        assert!(!descriptions.contains(&"hunk"));
+        assert!(!descriptions.contains(&"comment nav"));
+        assert!(!descriptions.contains(&"tree width"));
+        assert!(hints.iter().any(|(key, _)| key == "]/["));
+    }
+
+    #[test]
+    fn compact_review_hints_preserve_scope_and_help() {
+        let hints = review_stream_hints(60, false, Some((false, false)), true);
+        let descriptions: Vec<_> = hints.iter().map(|(_, description)| *description).collect();
+
+        assert!(descriptions.contains(&"reload"));
+        assert!(descriptions.contains(&"comment"));
+        assert!(descriptions.contains(&"scope"));
+        assert!(descriptions.contains(&"help"));
+        assert!(!descriptions.contains(&"pick file"));
+        assert!(!descriptions.contains(&"hide tree"));
+    }
+
+    #[test]
+    fn live_search_gets_a_dedicated_hint_set() {
+        let hints = review_stream_hints(60, true, Some((false, false)), true);
+        let descriptions: Vec<_> = hints.iter().map(|(_, description)| *description).collect();
+
+        assert!(descriptions.contains(&"match"));
+        assert!(descriptions.contains(&"clear search"));
+        assert!(descriptions.contains(&"scope"));
+        assert!(descriptions.contains(&"help"));
+        assert!(!descriptions.contains(&"reload"));
+        assert!(!descriptions.contains(&"show full diff"));
+        assert!(!descriptions.contains(&"pick file"));
+    }
 
     #[test]
     fn tree_grows_on_wide_screens_but_preserves_diff_space() {

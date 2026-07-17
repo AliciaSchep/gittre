@@ -271,6 +271,7 @@ impl Stream {
         }
     }
 
+    #[cfg(test)]
     pub fn has_comments(&self) -> bool {
         !self.comment_starts.is_empty()
     }

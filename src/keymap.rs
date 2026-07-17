@@ -617,4 +617,27 @@ mod tests {
         assert_eq!(key_for(REVIEW, Action::HalfPageDown), "⌃d");
         assert_eq!(key_for(EXPORT_PREVIEW, Action::WriteFile), "w");
     }
+
+    #[test]
+    fn help_keeps_accelerators_removed_from_the_normal_bar() {
+        let help_has = |action| {
+            HELP.iter().any(|(_, items)| {
+                items.iter().any(
+                    |item| matches!(item, HelpItem::Act(actions, _) if actions.contains(&action)),
+                )
+            })
+        };
+
+        for action in [
+            NextHunk,
+            PrevHunk,
+            NextComment,
+            PrevComment,
+            NarrowTree,
+            WidenTree,
+            AutoTreeWidth,
+        ] {
+            assert!(help_has(action), "{action:?} missing from help");
+        }
+    }
 }

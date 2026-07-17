@@ -81,8 +81,8 @@ Running `gittre` in a repo opens the **scope picker** — a simple menu, no flag
 │ README.md  M   │  ...                                        │
 │                │                                             │
 └────────────────┴─────────────────────────────────────────────┘
- ↑↓/jk scroll  ]/[ file  n/p hunk  ⏎ tree/jump
- t tree  </> width  = auto  q scope  ? help
+ j/k scroll  ]/[ file  ⏎ full diff  / search  r reload  c comment
+ Tab files  t tree  q scope  ? help
 ```
 
 - **Right pane: the diff stream.** All changed files concatenated into one
@@ -96,8 +96,16 @@ Running `gittre` in a repo opens the **scope picker** — a simple menu, no flag
   opens a file (or toggles a directory), `Esc` cancels; control returns to the
   diff after a jump. `t` hides/shows the pane; `</>` resize it in four-column
   steps and `=` restores content-aware automatic sizing.
-- **Bottom command bar** always lists the actions valid *right now* (gitui's
-  signature pattern). It changes with focus/mode; `?` opens a full help popup.
+- **Bottom command bar** teaches the primary actions valid *right now*
+  (gitui's signature pattern), while `?` is the complete binding reference.
+  It changes with focus/mode: live search promotes `n`/`N` match navigation,
+  selection promotes copy/comment actions, and tree focus promotes `</>/=`
+  sizing. Accelerators such as normal `n`/`p` hunk navigation and `}`/`{`
+  comment navigation live in help instead of permanently crowding the bar.
+  Below 70 columns, file-picker and tree-toggle hints also yield so `q` and
+  `?` remain visible. Keys use color/weight instead of decorative brackets,
+  avoiding ambiguity between the literal `]`/`[` keys and `/`. Hint groups
+  pack atomically and are never half-clipped.
 - `q` (or `Esc` at the top layer) returns to the scope picker. Reloads within
   a scope preserve review state; opening a scope starts a fresh review. `x` is
   helix's select-line, not an exit.
@@ -250,7 +258,9 @@ expand" row.
   to automatic sizing with `=`. `Enter` now expands/collapses a modified file
   inline while retaining diff markers; the canonical three-line-context diff
   remains the sole source for comment anchoring, so newly revealed unchanged
-  lines are read/search/copy-only. Mouse dragging is permanently out of scope.
+  lines are read/search/copy-only. The bottom bar was pared back to primary and
+  mode-specific actions, with a compact narrow-terminal tier; `?` remains the
+  exhaustive reference. Mouse dragging is permanently out of scope.
 
 Each milestone is shippable; M1–M3 is already a useful daily tool.
 
