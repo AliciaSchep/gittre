@@ -168,7 +168,7 @@ impl BasePicker {
 pub struct LogPicker {
     pub entries: Vec<LogEntry>,
     pub selected: usize,
-    /// Range base marked with Space; Enter then reviews marked..selected.
+    /// Inclusive range start marked with Space; Enter reviews it through selected.
     pub marked: Option<git2::Oid>,
     pub state: ListState,
     last_inner: Cell<Rect>,
@@ -185,7 +185,7 @@ impl LogPicker {
         }
     }
 
-    /// Space: mark the selected commit as range base (again to unmark).
+    /// Space: mark the selected commit as inclusive range start (again to unmark).
     pub fn toggle_mark(&mut self) {
         let Some(entry) = self.entries.get(self.selected) else {
             return;

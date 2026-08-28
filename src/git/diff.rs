@@ -420,7 +420,9 @@ fn tree_order(a: &str, b: &str) -> std::cmp::Ordering {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::git::scope::{Scope, commit_scope, file_count_fast, forkable_branch};
+    use crate::git::scope::{
+        Scope, commit_scope, file_content, file_count_fast, forkable_branch, rev_scope,
+    };
     use std::fs;
     use std::path::Path;
 
@@ -572,6 +574,74 @@ mod tests {
         let result = load(&repo, &root).unwrap();
         assert_eq!(result.files.len(), 2);
         assert_eq!(find(&result, "a.txt").status, FileStatus::Added);
+    }
+
+    #[test]
+    fn two_dot_range_includes_both_endpoints_and_commits_between() {
+        let (dir, repo) = setup();
+        fs::write(dir.path().join("start.txt"), "start\n").unwrap();
+        commit_all(&repo, "range start");
+        fs::write(dir.path().join("middle.txt"), "middle\n").unwrap();
+        commit_all(&repo, "range middle");
+        fs::write(dir.path().join("end.txt"), "end\n").unwrap();
+        commit_all(&repo, "range end");
+
+        let scope = rev_scope(&repo, "HEAD~2..HEAD").unwrap();
+        let result = load(&repo, &scope).unwrap();
+        assert_eq!(result.files.len(), 3);
+        assert_eq!(find(&result, "start.txt").status, FileStatus::Added);
+        assert_eq!(find(&result, "middle.txt").status, FileStatus::Added);
+        assert_eq!(find(&result, "end.txt").status, FileStatus::Added);
+    }
+
+    #[test]
+    fn inclusive_range_from_root_diffs_against_empty_tree() {
+        let (dir, repo) = setup();
+        fs::write(dir.path().join("later.txt"), "later\n").unwrap();
+        commit_all(&repo, "after root");
+
+        let scope = rev_scope(&repo, "HEAD~1..HEAD").unwrap();
+        let result = load(&repo, &scope).unwrap();
+        assert_eq!(result.files.len(), 3);
+        assert_eq!(find(&result, "a.txt").status, FileStatus::Added);
+        assert_eq!(find(&result, "src/lib.rs").status, FileStatus::Added);
+        assert_eq!(find(&result, "later.txt").status, FileStatus::Added);
+    }
+
+    #[test]
+    fn three_dot_range_keeps_merge_base_diff_semantics() {
+        let (dir, repo) = setup();
+        fs::write(dir.path().join("base.txt"), "base\n").unwrap();
+        commit_all(&repo, "merge base");
+        fs::write(dir.path().join("tip.txt"), "tip\n").unwrap();
+        commit_all(&repo, "tip");
+
+        let scope = rev_scope(&repo, "HEAD~1...HEAD").unwrap();
+        let result = load(&repo, &scope).unwrap();
+        assert_eq!(result.files.len(), 1);
+        assert_eq!(find(&result, "tip.txt").status, FileStatus::Added);
+    }
+
+    #[test]
+    fn inclusive_range_deleted_file_content_comes_from_start_parent() {
+        let (dir, repo) = setup();
+        fs::remove_file(dir.path().join("a.txt")).unwrap();
+        let mut index = repo.index().unwrap();
+        index.remove_path(Path::new("a.txt")).unwrap();
+        index.write().unwrap();
+        commit_all(&repo, "delete at range start");
+        fs::write(dir.path().join("later.txt"), "later\n").unwrap();
+        commit_all(&repo, "range end");
+
+        let scope = rev_scope(&repo, "HEAD~1..HEAD").unwrap();
+        let result = load(&repo, &scope).unwrap();
+        assert_eq!(find(&result, "a.txt").status, FileStatus::Deleted);
+        let (content, label) = file_content(&repo, &scope, "a.txt").unwrap();
+        assert_eq!(content, "one\ntwo\nthree\n");
+        assert_eq!(
+            label,
+            format!("{:.7}", repo.revparse_single("HEAD~2").unwrap().id())
+        );
     }
 
     /// Commit one added file directly onto a ref, without touching HEAD or

@@ -63,7 +63,9 @@ Running `gittre` in a repo opens the **scope picker** — a simple menu, no flag
 - Option 4 compares against an explicitly picked branch (merge-base
   semantics) — always on the menu (2026-07), not just a fallback.
 - Option 5 opens the commit log list (subject, author, age); Enter reviews a
-  commit, and Space marks a range start so the next Enter reviews the range.
+  commit, and Space marks an inclusive range start so the next Enter reviews
+  that commit, the selected end, and every commit between them (as one net
+  diff from the start's first parent to the end).
 - CLI shortcuts exist for scripting/muscle-memory but are never required:
   `gittre` (picker) · `gittre -u` (uncommitted) · `gittre -s` (staged) ·
   `gittre -b [base]` (branch) · `gittre <sha>` · `gittre <a>..<b>`.
@@ -223,8 +225,11 @@ expand" row.
      worktree scopes; `q`/`Esc` back); `E` suspends the TUI and opens
      `$EDITOR` at file:line (disk content — exact for worktree scopes, best
      effort for historical ones).
-  5. ✅ **Commit ranges**: Space in the log picker marks a base, Enter picks the
-     tip → review `base..tip`; CLI `gittre a..b`.
+  5. ✅ **Inclusive commit ranges**: Space in the log picker marks the start,
+     Enter picks the end → review the net changes from the start's first parent
+     (or the empty tree when it is a root) through the end. CLI `gittre a..b`
+     follows the same inclusive rule; `a...b` keeps Git's merge-base-to-`b`
+     diff semantics.
   6. ✅ **Syntax highlighting** (`syntect`, per-visible-line, cached,
      independent per-line like delta; add/remove stays as bg tint).
 

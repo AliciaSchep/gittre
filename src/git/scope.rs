@@ -16,8 +16,15 @@ pub enum Scope {
     BranchFork { branch: String },
     /// One commit vs its first parent.
     Commit { id: Oid, summary: String },
-    /// Everything between two commits: tree(from) vs tree(to).
-    Range { from: Oid, to: Oid },
+    /// The net changes across two commits. `include_from` compares the first
+    /// parent's tree of `from` (or the empty tree for a root commit) to `to`,
+    /// so both endpoints are part of a picker / `a..b` range. Three-dot CLI
+    /// ranges retain git-diff semantics and use `from` as the baseline.
+    Range {
+        from: Oid,
+        to: Oid,
+        include_from: bool,
+    },
 }
 
 impl Scope {
@@ -35,7 +42,17 @@ impl Scope {
                 }
                 format!("commit {id:.7} \u{201c}{s}\u{201d}")
             }
-            Scope::Range { from, to } => format!("range {from:.7}..{to:.7}"),
+            Scope::Range {
+                from,
+                to,
+                include_from,
+            } => {
+                if *include_from {
+                    format!("range {from:.7} through {to:.7}")
+                } else {
+                    format!("range {from:.7}..{to:.7}")
+                }
+            }
         }
     }
 
@@ -265,13 +282,22 @@ fn build_diff_with<'r>(
             repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&commit.tree()?), Some(&mut opts))
                 .context("diffing commit vs parent")?
         }
-        Scope::Range { from, to } => {
-            let from_tree = repo
-                .find_commit(*from)
-                .context("finding range start")?
-                .tree()?;
+        Scope::Range {
+            from,
+            to,
+            include_from,
+        } => {
+            let from_commit = repo.find_commit(*from).context("finding range start")?;
+            let from_tree = if *include_from {
+                match from_commit.parent(0) {
+                    Ok(parent) => Some(parent.tree()?),
+                    Err(_) => None, // root start: include it via the empty tree
+                }
+            } else {
+                Some(from_commit.tree()?)
+            };
             let to_tree = repo.find_commit(*to).context("finding range end")?.tree()?;
-            repo.diff_tree_to_tree(Some(&from_tree), Some(&to_tree), Some(&mut opts))
+            repo.diff_tree_to_tree(from_tree.as_ref(), Some(&to_tree), Some(&mut opts))
                 .context("diffing range")?
         }
     };
@@ -342,8 +368,8 @@ pub fn file_count_fast(repo: &Repository, scope: &Scope) -> usize {
     diff.map_or(0, |d| d.deltas().len())
 }
 
-/// Resolve `a..b` / `a...b` (git-diff semantics: `...` diffs from the
-/// merge base of a and b) or a single revision into a scope.
+/// Resolve an inclusive `a..b`, a git-diff-style `a...b` (merge base to b),
+/// or a single revision into a scope.
 pub fn rev_scope(repo: &Repository, spec: &str) -> Result<Scope> {
     let (a, b, three_dot) = if let Some((a, b)) = spec.split_once("...") {
         (a, b, true)
@@ -368,7 +394,11 @@ pub fn rev_scope(repo: &Repository, spec: &str) -> Result<Scope> {
             .merge_base(from, to)
             .context("no merge base for '...' range")?;
     }
-    Ok(Scope::Range { from, to })
+    Ok(Scope::Range {
+        from,
+        to,
+        include_from: !three_dot,
+    })
 }
 
 /// Resolve a user-supplied revision string into a commit scope.
@@ -451,12 +481,21 @@ pub fn file_content(repo: &Repository, scope: &Scope, path: &str) -> Result<(Str
                 from_tree(&parent.tree().ok()?, format!("{:.7}", parent.id()))
             })
         }
-        Scope::Range { from, to } => {
+        Scope::Range {
+            from,
+            to,
+            include_from,
+        } => {
             let to_tree = repo.find_commit(*to).context("finding range end")?.tree()?;
             from_tree(&to_tree, format!("{to:.7}")).or_else(|| {
-                // Deleted within the range: show the starting version.
-                let tree = repo.find_commit(*from).ok()?.tree().ok()?;
-                from_tree(&tree, format!("{from:.7}"))
+                // Deleted within the range: show the old side's version.
+                let commit = repo.find_commit(*from).ok()?;
+                let old = if *include_from {
+                    commit.parent(0).ok()?
+                } else {
+                    commit
+                };
+                from_tree(&old.tree().ok()?, format!("{:.7}", old.id()))
             })
         }
     };

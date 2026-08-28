@@ -494,7 +494,7 @@ pub static HELP: &[(&str, &[HelpItem])] = &[
         "General",
         &[
             HelpItem::Raw("1-9", "picker: open that entry"),
-            HelpItem::Raw("Space", "commit log: mark a range start"),
+            HelpItem::Raw("Space", "commit log: mark an inclusive range start"),
             HelpItem::Raw("?", "toggle this help"),
             HelpItem::Raw("q / Esc", "back; quits from the picker"),
             HelpItem::Raw("⌃c", "quit from anywhere"),

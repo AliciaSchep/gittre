@@ -55,6 +55,10 @@ CLI shortcuts: `gittre -u` (uncommitted) · `-s` (staged) · `-b` (branch vs
 fork point) · `-b <base>` (vs merge-base) · `gittre <rev>` · `gittre a..b` ·
 `-C <path>`.
 
+Commit ranges are inclusive: choosing A through B (or running `gittre A..B`)
+reviews the net changes introduced by A, B, and the commits between them.
+`A...B` retains Git's merge-base-to-B diff semantics.
+
 ### Reading
 
 The keys are helix-friendly. `j`/`k` move the cursor (`gg`/`ge` top/bottom,

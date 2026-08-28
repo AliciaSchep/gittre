@@ -20,7 +20,7 @@ struct Args {
     #[command(subcommand)]
     command: Option<Command>,
 
-    /// Review a commit (sha, ref, HEAD~2) or a range (a..b, a...b)
+    /// Review a commit (sha, ref, HEAD~2), inclusive range (a..b), or merge-base range (a...b)
     rev: Option<String>,
 
     /// Review all uncommitted work (working tree + index vs HEAD)

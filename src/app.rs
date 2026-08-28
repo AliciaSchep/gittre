@@ -1052,7 +1052,7 @@ impl App {
                     vec![
                         h(t, &[Down, Up], "select"),
                         h(t, &[Activate], "review commit"),
-                        h(t, &[MarkRange], "mark range start"),
+                        h(t, &[MarkRange], "mark inclusive start"),
                         h(t, &[Back], "back"),
                         raw("?", "help"),
                     ]
@@ -1469,8 +1469,12 @@ impl App {
             return;
         };
         let scope = match log.marked {
-            // A marked base + a different selection = review the range.
-            Some(from) if from != entry.id => Scope::Range { from, to: entry.id },
+            // A marked start + a different selection = review both endpoints.
+            Some(from) if from != entry.id => Scope::Range {
+                from,
+                to: entry.id,
+                include_from: true,
+            },
             _ => Scope::Commit {
                 id: entry.id,
                 summary: entry.summary.clone(),
